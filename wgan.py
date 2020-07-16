@@ -11,37 +11,43 @@ class Wasserstein_GAN(object):
     self._max_epochs           = retrieve_kw(kw, 'max_epochs',           2000                                                       )
     self._batch_size           = retrieve_kw(kw, 'batch_size',           128                                                        )
     self._n_features           = retrieve_kw(kw, 'n_features',           NotSet                                                     )
-    self._latent_dim           = retrieve_kw(kw, 'latent_dim',           100                                                        )
     self._n_critic             = retrieve_kw(kw, 'n_critic',               0                                                        )
     self._result_file          = retrieve_kw(kw, 'result_file',          NotSet                                                     )
-    self._soft_label           = retrieve_kw(kw, 'soft_label',           False                                                      )
     self._save_interval        = retrieve_kw(kw, 'save_interval',        1000                                                       )
     self._use_gradient_penalty = retrieve_kw(kw, 'use_gradient_penalty', True                                                       )
-    self._grad_weight          = retrieve_kw(kw, 'grad_weight',          10.0                                                       )
     self._verbose              = retrieve_kw(kw, 'verbose',              False                                                      )
     self._gen_opt              = retrieve_kw(kw, 'gen_opt',              tf.optimizers.Adam(lr=2e-4, beta_1=0.5, decay=1e-4 )       )
     self._critic_opt           = retrieve_kw(kw, 'critic_opt',           tf.optimizers.Adam(lr=2e-4, beta_1=0.5, decay=1e-4 )       )
-    self._seed                 = retrieve_kw(kw, 'seed',                 None                                                       )
     self._tf_call_kw           = retrieve_kw(kw, 'tf_call_kw',           {}                                                         )
+    self._grad_weight          = tf.constant( retrieve_kw(kw, 'grad_weight',          10.0                                          ) )
+    self._latent_dim           = tf.constant( retrieve_kw(kw, 'latent_dim',           100                                           ) )
 
     # Initialize discriminator and generator networks
     self.critic = self._build_critic()
     self.generator = self._build_generator()
 
-  def logp(self, latent):
+  def latent_dim(self):
+    return self._latent_dim
+
+  @tf.function
+  def latent_log_prob(self, latent):
     prior = tfp.distributions.MultivariateNormalDiag(loc=tf.zeros(self._latent_dim),
                                                      scale_diag=tf.ones(self._latent_dim))
     return prior.log_prob(latent)
 
+  @tf.function
   def wasserstein_loss(self, y_true, y_pred):
     return tf.reduce_mean(y_true) - tf.reduce_mean(y_pred)
 
+  @tf.function
   def sample_latent_data(self, nsamples):
     return tf.random.normal((nsamples, self._latent_dim))
 
+  @tf.function
   def transform(self, latent):
     return self.generator( latent, **self._tf_call_kw)
 
+  @tf.function
   def generate(self, nsamples):
     return self.transform( self.sample_latent_data( nsamples ))
 
@@ -56,11 +62,11 @@ class Wasserstein_GAN(object):
     train_dataset = tf.data.Dataset.from_tensor_slices( train_data ).batch( self._batch_size, drop_remainder = True )
 
     # checkpoint for the model
-    checkpoint_maker = tf.train.Checkpoint(generator_optimizer=self._gen_opt,
-        discriminator_optimizer=self._critic_opt,
-        generator=self.generator,
-        discriminator=self.critic
-    ) if self._result_file else None
+    #checkpoint_maker = tf.train.Checkpoint(generator_optimizer=self._gen_opt,
+    #    discriminator_optimizer=self._critic_opt,
+    #    generator=self.generator,
+    #    discriminator=self.critic
+    #) if self._result_file else None
 
     # containers for losses
     losses = {'critic': [], 'generator': [], 'regularizer': []}
@@ -84,16 +90,33 @@ class Wasserstein_GAN(object):
         losses['regularizer'].append(reg_loss)
         updates += 1
         # Save current model
-        if checkpoint_maker and not(updates % self._save_interval):
-          checkpoint_maker.save(file_prefix=self._result_file)
-          pass
+        #if checkpoint_maker and not(updates % self._save_interval):
+        #  checkpoint_maker.save(file_prefix=self._result_file)
+        #  pass
         # Print logging information
-        if self._verbose and not(epoch % 10) or not(updates % 1000):
+        if self._verbose and not(updates % self._save_interval):
           perc = np.around(100*epoch/self._max_epochs, decimals=1)
           print('Epoch: %i. Updates %i. Training %1.1f%% complete. Critic_loss: %.3f. Gen_loss: %.3f. Regularizer: %.3f'
                % (epoch, updates, perc, critic_loss, gen_loss, reg_loss ))
-    return self.generator, losses
+    #checkpoint_maker.save(file_prefix=self._result_file)
+    self.save( overwrite = True )
+    return losses
 
+  def save(self, overwrite = False ):
+    self.generator.save_weights( self._result_file + '_generator', overwrite )
+    self.critic.save_weights( self._result_file + '_critic', overwrite )
+
+  def load(self, path ):
+    self.generator.load_weights( path + '_generator' )
+    self.critic.load_weights( path + '_critic' )
+
+  def _build_critic(self):
+    raise NotImplementedError("Overload Wasserstein_GAN class with a critic model")
+
+  def _build_generator(self):
+    raise NotImplementedError("Overload Wasserstein_GAN class with a generator model")
+
+  @tf.function
   def _gradient_penalty(self, x, x_hat):
     epsilon = tf.random.uniform((x.shape[0], 1, 1), 0.0, 1.0)
     u_hat = epsilon * x + (1 - epsilon) * x_hat
@@ -102,24 +125,21 @@ class Wasserstein_GAN(object):
       func = self.critic(u_hat)
     grads = penalty_tape.gradient(func, u_hat)
     norm_grads = tf.sqrt(tf.reduce_sum(tf.square(grads), axis=[1, 2]))
-    regularizer = tf.reduce_mean((norm_grads - 1) ** 2)
+    regularizer = tf.math.square( tf.reduce_mean((norm_grads - 1) ) )
     return regularizer
 
-  def _build_critic(self):
-    raise NotImplementedError("Overload Wasserstein_GAN class with a critic model")
 
-  def _build_generator(self):
-    raise NotImplementedError("Overload Wasserstein_GAN class with a generator model")
-
+  @tf.function
   def _get_critic_output( self, samples, fake_samples ):
     # calculate critic outputs
     real_output = self.critic(samples, **self._tf_call_kw)
     fake_output = self.critic(fake_samples, **self._tf_call_kw)
     return real_output, fake_output
 
+  @tf.function
   def _get_critic_loss( self, samples, fake_samples, real_output, fake_output ):
-    grad_regularizer_loss = (self._grad_weight * self._gradient_penalty(samples, fake_samples)) if self._use_gradient_penalty else 0
-    critic_loss = self.wasserstein_loss(real_output, fake_output) + grad_regularizer_loss
+    grad_regularizer_loss = tf.multiply(self._grad_weight, self._gradient_penalty(samples, fake_samples)) if self._use_gradient_penalty else 0
+    critic_loss = tf.add( self.wasserstein_loss(real_output, fake_output), grad_regularizer_loss )
     return critic_loss, grad_regularizer_loss
 
   def _get_gen_loss( self, fake_samples, fake_output ):
@@ -146,7 +166,6 @@ class Wasserstein_GAN(object):
     self._apply_critic_update( critic_tape, critic_loss )
     return critic_loss, grad_regularizer_loss
 
-
   @tf.function
   def _train_step(self, samples):
     with tf.GradientTape() as gen_tape, tf.GradientTape() as critic_tape:
@@ -158,4 +177,3 @@ class Wasserstein_GAN(object):
     self._apply_critic_update( critic_tape, critic_loss )
     self._apply_gen_update( gen_tape, gen_loss )
     return critic_loss, gen_loss, critic_regularizer
-

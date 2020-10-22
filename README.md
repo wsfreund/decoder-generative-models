@@ -6,6 +6,9 @@ This repository contains the implementation of the following models:
   Dumoulin, and Aaron Courville. "Improved Training of Wasserstein GANs."
   Advances in Neural Information Processing Systems, March 31, 2017, 5768–78.
   http://arxiv.org/abs/1704.00028.
+- Autoencoder with support to multiple feature types. Autoencoder loss may
+  be masked to avoid correcting gradients to specific features. I.e. imputed
+  data.
 
 # License and warranty
 

@@ -1,16 +1,18 @@
 class NotSetType( type ):
   def __bool__(self):
     return False
+  def __len__(self):
+    return False
   __nonzero__ = __bool__
   def __repr__(self):
     return "<+NotSet+>"
   def __str__(self):
     return "<+NotSet+>"
 
-class NotSet( object ): 
+class NotSet( object, metaclass=NotSetType ): 
   """As None, but can be used with retrieve_kw to have a unique default value
   through all job hierarchy."""
-  __metaclass__ = NotSetType
+  pass
 
 def retrieve_kw( kw, key, default = NotSet ):
   """
@@ -21,7 +23,6 @@ def retrieve_kw( kw, key, default = NotSet ):
     kw[key] = default
   return kw.pop(key)
 
-
 class Iterable(object):
   def __enter__(self):
     pass
@@ -31,3 +32,10 @@ class Iterable(object):
       to_delete = [k for k in self.__dict__ if k.startswith('_l_')]
       for d in to_delete: 
         del self.__dict__[d]
+
+def fix_model_layers(model):
+  from tensorflow.keras.layers import Layer
+  model._layers = [
+    layer for layer in model._layers if isinstance(layer, Layer)
+  ]
+  return model

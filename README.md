@@ -7,8 +7,9 @@ This repository contains the implementation of the following models:
   Advances in Neural Information Processing Systems, March 31, 2017, 5768–78.
   http://arxiv.org/abs/1704.00028.
 - Autoencoder with support to multiple feature types. Autoencoder loss may
-  be masked to avoid correcting gradients to specific features. I.e. imputed
-  data.
+  be masked to avoid applying gradient-based optimisation for specific features
+  per example. One possible application is to avoid training model to replicate
+  imputed data.
 
 # License and warranty
 

@@ -170,7 +170,7 @@ def hot_encode(df, categorical, keep_numerical = True):
 class BeyondNumericalDataModel(TrainBase):
 
   def __init__(self, input_info_dict, **kw):
-    TrainBase.__init__(self, **kw)
+    super().__init__(**kw)
     import itertools
     self._input_info_dict = input_info_dict
     # Compute feature type masks

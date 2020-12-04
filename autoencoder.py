@@ -15,7 +15,7 @@ except ImportError:
 class AutoEncoder( ModelWithEmbeddings ):
 
   def __init__(self, input_info_dict, train_data = None, train_mask = None, **kw):
-    ModelWithEmbeddings.__init__(self, input_info_dict = input_info_dict, **kw )
+    super().__init__(input_info_dict = input_info_dict, **kw )
     # Retrieve optimizer
     self._ae_opt = retrieve_kw(kw, 'ae_opt', tf.optimizers.Adam() ) 
     # Define loss keys
@@ -41,16 +41,16 @@ class AutoEncoder( ModelWithEmbeddings ):
                        }
 
   @tf.function
-  def encode(self, x):
-    return self.encoder( x )
+  def encode(self, x, **call_kw):
+    return self.encoder( x, **call_kw )
 
   @tf.function
-  def decode(self, code):
-    return self.decoder( code )
+  def decode(self, code, **call_kw):
+    return self.decoder( code, **call_kw )
 
   @tf.function
-  def reconstruction(self, x):
-    return self.decode( self.encode( x ) )
+  def reconstruction(self, x, **call_kw):
+    return self.decode( self.encode( x, **call_kw ), **call_kw )
 
   def compute_loss(self, x, mask):
     return self._total_loss(x, mask, self._train_model, self._compute_ae_loss, prefix = "ae")
@@ -118,7 +118,7 @@ class AutoEncoder( ModelWithEmbeddings ):
   @tf.function
   def _train_step(self, x, mask ):
     with tf.GradientTape() as ae_tape:
-      train_outputs = self._train_model( x, training = True )
+      train_outputs = self._train_model( x, **self._training_kw )
       ae_loss_dict = self._compute_ae_loss( x, train_outputs, mask, )
     # ae_tape,
     self._apply_ae_update( ae_tape, ae_loss_dict['ae_total'] )

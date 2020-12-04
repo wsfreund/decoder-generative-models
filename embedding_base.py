@@ -140,7 +140,7 @@ class ModelWithEmbeddings( BeyondNumericalDataModel ):
       , output_head_hidden_layer_master_switch = True
       , output_head_bias_statistics_master_switch = True
       , **kw):
-    BeyondNumericalDataModel.__init__(self, input_info_dict, **kw)
+    super().__init__(input_info_dict, **kw)
     self._embeddings_master_switch = embeddings_master_switch
     self._output_head_hidden_layer_master_switch = output_head_hidden_layer_master_switch 
     self._output_head_bias_statistics_master_switch = output_head_bias_statistics_master_switch

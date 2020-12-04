@@ -35,11 +35,16 @@ class TrainingCriticalAbort( BaseException ):
 class BreakDueToNonFinite( TrainingCriticalAbort ):
   pass
 
+class Container(object):
+  pass
+
 class TrainBase(MaskModel):
-  def __init__(self, **kw):
+  def __init__(self, data_sampler, **kw):
+    super().__init__()
+    self.data_sampler = data_sampler
     ## Configuration
-    # tf_call_kw: propagate "training = True" for dropout
-    self._tf_call_kw               = retrieve_kw(kw, 'tf_call_kw',           {}                                                         )
+    # training_kw: propagate "training = True" for dropout
+    self._training_kw              = retrieve_kw(kw, 'training_kw',          {'training' : True}                                        )
     # Cycle for computing validation steps
     self._validation_steps         = retrieve_kw(kw, 'validation_steps',     25                                                         )
     # Maximum number of training epoches (cycles through training dataset)
@@ -54,122 +59,159 @@ class TrainBase(MaskModel):
     self._min_progress             = retrieve_kw(kw, 'min_progress',         1e-4                                                       )
     # Whether to log training progress
     self._verbose                  = retrieve_kw(kw, 'verbose',              False                                                      )
+    # Whether to show online train plot
+    self._load_model_at_path       = retrieve_kw(kw, 'load_model_at_path',   None                                                       )
+    # Whether to show online train plot
+    self._online_train_plot        = retrieve_kw(kw, 'online_train_plot',    False                                                      )
     # Interval for logging using updates
-    self._print_interval_updates   = retrieve_kw(kw, 'print_interval_updates', 1000                                                     )
+    self._print_interval_steps     = retrieve_kw(kw, 'print_interval_steps', 1000                                                       )
     # Interval for logging using wall time
     self._print_interval_wall_time = retrieve_kw(kw, 'print_interval_wall_time', datetime.timedelta( seconds = 15 )                     )
     # Interval for logging using epoches
     self._print_interval_epoches   = retrieve_kw(kw, 'print_interval_epoches', 5                                                        )
+    # Interval for logging using updates
+    self._save_interval_steps     = retrieve_kw(kw, 'save_interval_steps',   None                                                       )
+    # Interval for logging using wall time
+    self._save_interval_wall_time = retrieve_kw(kw, 'save_interval_wall_time', datetime.timedelta( minutes = 5 )                        )
+    # Interval for logging using epoches
+    self._save_interval_epoches   = retrieve_kw(kw, 'save_interval_epoches',  None                                                      )
+    # Use log-sampling periods of loss functions
+    self._use_log_history          = retrieve_kw(kw, 'use_log_history',      True                                                       )
+    # Number of history samples when using log-sampled history
+    self._max_n_history_samples    = retrieve_kw(kw, 'log_n_linear_history_samples',    50                                              )
+    # Log-sampling period. To sample more, use lower values, i.e. 0.005. To sample less, higher values, i.e. 0.05
+    self._log_sampling_period      = retrieve_kw(kw, 'log_sampling_period',  0.01                                                       )
     # File path to be used when saving/loading
-    self._result_file              = retrieve_kw(kw, 'result_file',          "model.weights"                                            )
-    # Batch size used for computations during training
-    self._batch_size               = retrieve_kw(kw, 'batch_size',           128                                                        )
-    # Batch size used for model evaluation using full dataset. When None, use the training size.
+    self._save_model_at_path       = retrieve_kw(kw, 'save_model_at_path',   "trained_model"                                            )
+    # Batch size used for model evaluation using full dataset. When None, use the full dataset size.
     self._eval_batch_size          = retrieve_kw(kw, 'eval_batch_size',      None                                                       )
-    # Element-wise gradient clipping value
-    self._grad_clipping            = tf.constant( retrieve_kw(kw, 'grad_clipping',        False  ), dtype=tf.float32 )
-    # Shuffle buffer for the training dataset. When False, disable shuffling. When None, use the training size.
-    self._shuffle_buffer           = retrieve_kw(kw, 'shuffle_buffer',       None                                                       )
-    # Reshuffle dataset at each iteration
-    self._reshuffle_each_iteration = retrieve_kw(kw, 'reshuffle_each_iteration', False                                                  )
+    # Function to extract information from samples
+    self._sample_parser_fcn        = retrieve_kw(kw,  'sample_parser_fcn',    None                                                      )
+    # Whether to apply gradient clipping
+    self._use_grad_clipping        = tf.constant( retrieve_kw(kw, 'use_grad_clipping', False  ) )
+    # Gradient clipping function
+    self._grad_clipping_fcn        = retrieve_kw(kw, 'grad_clipping_fcn', lambda x: tf.clip_by_norm( x, 2.0 )  )
     ## Setup
-    self._lkeys      = set()
-    self._val_lkeys  = set()
+    self._lkeys      = {"step",}
+    self._val_lkeys  = {"step",}
     self._val_prefix = '' # TODO Make it become a set
     self._loss_fcn = None
     self._model_dict = {}
+    self._optimizer_dict = {}
     ## Sanity checks
     if self._max_train_wall_time is not None:
       assert isinstance(self._max_train_wall_time, datetime.timedelta)
     if self._print_interval_wall_time is not None:
       assert isinstance(self._print_interval_wall_time, datetime.timedelta)
+    #if self._load_model_at_path is not None:
 
-  def train(self, train_data, train_mask = None, val_data = None, val_mask = None):
+  def train(self):
     start_train_wall_time = datetime.datetime.now()
     gpus = tf.config.experimental.list_physical_devices('GPU')
     n_gpus = len(gpus)
     if self._verbose: print('This machine has %i GPUs.' % n_gpus)
 
-    # NOTE without drop_remainder, there is the need to specify the input_signature, i.e.:
-    # @tf.function(input_signature=(tf.TensorSpec(shape=[None], dtype=tf.float32),))
-    train_dataset = tf.data.Dataset.from_tensor_slices( (train_data, train_mask), )
-    if self._shuffle_buffer is not False:
-      train_dataset = train_dataset.shuffle( train_data.shape[0] if self._shuffle_buffer is None else self._shuffle_buffer
-                                           , reshuffle_each_iteration=self._reshuffle_each_iteration )
-    train_dataset = train_dataset.batch( self._batch_size, drop_remainder = True )
-        
-    determinist_train_dataset = (tf.Variable(train_data, dtype = tf.float32), tf.Variable(train_mask, dtype = tf.float32) if train_mask else None )
-
-    if val_data is not None:
-      if "early_stopping_key" not in self.__dict__:
-        raise ValueError("Specified val_data but no early_stopping key is specified.")
-      else:
-        val_dataset = (tf.Variable(val_data, dtype = tf.float32), tf.Variable(val_mask, dtype = tf.float32) )
-        best_model_temp_path = os.path.join( tempfile.mkdtemp(), os.path.basename(self._result_file) )
-      best_epoch = 0; best_step = 0; last_progress_step = 0; best_val_reco = np.finfo( dtype = np.float32 ).max
-    else:
-      val_dataset = None
-
-    if val_data is None and self._max_epoches is None and self._max_steps is None:
-      raise ValueError("Stopping criteria not specified. Either specify early stopping, max number of epoches or steps or any combination of these criteria.")
-
     # containers for losses
-    loss_record = {k : [] for k in self._lkeys}
-    val_loss_record = {k : [] for k in self._val_lkeys}
+    lc = Container()
+    if self._load_model_at_path is not None:
+      lc.__dict__.update( self.load( self._load_model_at_path, return_loss = True) )
+      # Load local_keys
+      lc.__dict__.update( self.load( self._load_model_at_path, return_locals = True) )
+    else:
+      lc.loss_record = {k : [] for k in self._lkeys}
+      lc.val_loss_record = {k : [] for k in self._val_lkeys}
+      lc.best_epoch = lc.best_step = lc.last_progress_step = 0; lc.best_val_reco = np.finfo( dtype = np.float32 ).max
+      lc.p_sample_period = -np.inf; lc.n_history_samples = 0;
+      lc.step = lc.epoch = 0
+    last_print_cycle = last_save_cycle = 0
+    skipFinalVal = is_new_print_cycle = False;
+    exc_type = exc_val =  None
 
     # TODO reduce_lr = ReduceLROnPlateau(monitor='loss', patience=100, mode='auto',
     #                              factor=factor, cooldown=0, min_lr=1e-4, verbose=2)
-    step = batches = last_cycle = 0
-    skipFinalVal = is_new_cycle = False;
-    exc_type = exc_val =  None
     try:
-      for epoch, _ in enumerate(itertools.repeat(*[None]+([self._max_epoches] if self._max_epoches is not None else []))):
-        alreadyPrintedEpoch = False
-        for sample_batch, mask_batch in train_dataset:
+      while (lc.epoch < self._max_epoches if self._max_epoches else True):
+        alreadyPrintedEpoch = alreadySavedEpoch = False
+        for sample_batch in self.data_sampler.sampler_from_train_ds:
+          if self._sample_parser_fcn is not None:
+            sample_batch = self._sample_parser_fcn(sample_batch)
           evaluatedVal = False
-          loss_dict = self._train_base(epoch, step, sample_batch, mask_batch)
+          loss_dict = self._train_base(lc.epoch, lc.step, sample_batch)
           loss_dict = self._parse_train_loss( loss_dict, self._val_prefix )
+          loss_dict['step'] = lc.step
           # Keep track of training record:
-          self._append_loss(loss_record, loss_dict)
-          step += 1
+          c_sample_period = np.log10( lc.step + 1 ) // self._log_sampling_period
+          if c_sample_period  > lc.p_sample_period:
+            lc.p_sample_period = c_sample_period
+            lc.n_history_samples = 0
+          if lc.n_history_samples < self._max_n_history_samples:
+            self._append_loss(lc.loss_record, loss_dict)
           val_loss_dict = {}
           # Print logging information
-          if val_dataset is not None and ( not(step % self._validation_steps) or step == 1 ) and self._loss_fcn:
-            val_loss_dict = self._loss_fcn( val_dataset[0], val_dataset[1] )
-            val_loss_dict['step'] = step
+          if self.data_sampler.sampler_from_val_ds is not None and ( not(lc.step % self._validation_steps) or lc.step == 0 ) and self._loss_fcn:
+            val_loss_dict = self._loss_fcn( self.data_sampler.sampler_from_val_ds )
+            val_loss_dict['step'] = lc.step
             evaluatedVal = True
-            self._append_loss(val_loss_record, val_loss_dict, keys = self._val_lkeys)
-            if val_loss_dict[self.early_stopping_key] < best_val_reco:
-              if best_val_reco - val_loss_dict[self.early_stopping_key] > self._min_progress:
-                last_progress_step = step
-              best_val_reco = val_loss_dict[self.early_stopping_key]
-              best_step = step; best_epoch = epoch 
-              self.save( overwrite = True, output_file = best_model_temp_path )
-            if ( step - last_progress_step ) >= self._max_fail:
+            if lc.n_history_samples < self._max_n_history_samples:
+              self._append_loss(lc.val_loss_record, val_loss_dict, keys = self._val_lkeys)
+            if val_loss_dict[self.early_stopping_key] < lc.best_val_reco:
+              if lc.best_val_reco - val_loss_dict[self.early_stopping_key] > self._min_progress:
+                lc.last_progress_step = lc.step
+              lc.best_val_reco = val_loss_dict[self.early_stopping_key]
+              lc.best_step = lc.step; lc.best_epoch = lc.epoch 
+              self.save( overwrite = True, val = True )
+            if ( lc.step - lc.last_progress_step ) >= self._max_fail:
               raise BreakDueToMaxFail()
           train_time = datetime.datetime.now() - start_train_wall_time
-          cycle = int( train_time / self._print_interval_wall_time ) if self._print_interval_wall_time is not None else 0
-          is_new_cycle = cycle > last_cycle
-          if (self._verbose and 
+          print_cycle = int( train_time / self._print_interval_wall_time ) if self._print_interval_wall_time is not None else 0
+          is_new_print_cycle = print_cycle > last_print_cycle
+          # Print loss
+          if ((self._verbose or self._online_train_plot) and 
                 (
-                  (not(step % self._print_interval_updates)) 
-                  or (not(epoch % self._print_interval_epoches) and not(alreadyPrintedEpoch) )
-                  or is_new_cycle
+                  (not(lc.step % self._print_interval_steps) if self._print_interval_steps is not None else False) 
+                  or ((not(lc.epoch % self._print_interval_epoches)  if self._print_interval_epoches is not None else False) and not(alreadyPrintedEpoch) )
+                  or is_new_print_cycle
                 )
               ):
-            last_improvement = { 'best_val_reco' : best_val_reco
-                , 'best_step' : best_step
-                , 'last_progress_step' : last_progress_step } if val_loss_dict else {}
-            self._print_progress(epoch, step, train_time, loss_dict, val_loss_dict, last_improvement )
-            if not(epoch % self._print_interval_epoches):
+            last_improvement = { 'best_val_reco' : lc.best_val_reco
+                               , 'best_step' : lc.best_step
+                               , 'last_progress_step' : lc.last_progress_step } if val_loss_dict else {}
+            if self._online_train_plot:
+              self._plot_train( lc.loss_record )
+            if self._verbose: 
+              self._replace_nans_with_last_report( loss_dict, lc.loss_record )
+              self._print_progress(lc.epoch, lc.step, train_time, loss_dict, val_loss_dict, last_improvement )
+            if not(lc.epoch % self._print_interval_epoches) if self._print_interval_epoches is not None else False:
               alreadyPrintedEpoch = True
-            if is_new_cycle:
-              last_cycle = cycle
-              is_new_cycle = False
-          if self._max_steps is not None and (step + 1 > self._max_steps):
+            if is_new_print_cycle:
+              last_print_cycle = print_cycle
+              is_new_print_cycle = False
+          if self._max_steps is not None and (lc.step + 1 > self._max_steps):
             raise BreakDueToUpdates()
           if self._max_train_wall_time is not None and (train_time > self._max_train_wall_time):
             raise BreakDueToWallTime()
+          lc.step += 1
+          if lc.n_history_samples < self._max_n_history_samples:
+            lc.n_history_samples += 1
+          save_cycle = int( train_time / self._save_interval_wall_time ) if self._save_interval_wall_time is not None else 0
+          is_new_save_cycle = save_cycle > last_save_cycle
+          # Save current model
+          if (
+              (not(lc.step % self._save_interval_steps) if self._save_interval_steps is not None else False) 
+              or ((not(lc.epoch % self._save_interval_epoches)  if self._save_interval_epoches is not None else False) and not(alreadySavedEpoch) )
+              or is_new_save_cycle
+             ):
+            loss_data = { 'train_record' : lc.loss_record
+                        , 'val_record' : lc.val_loss_record }
+            self.save( overwrite = True
+                , loss_data = loss_data
+                , locals_data = lc )
+            if not(lc.epoch % self._save_interval_epoches) if self._save_interval_epoches is not None else False:
+              alreadySavedEpoch = True
+            if is_new_save_cycle:
+              last_save_cycle = save_cycle
+              is_new_save_cycle = False
+        lc.epoch += 1
       raise BreakDueToEpoches
     except BaseException as e:
       exc_type, exc_val = sys.exc_info()[:2]
@@ -180,9 +222,9 @@ class TrainBase(MaskModel):
         if isinstance( exc_val, BreakDueToMaxFail ):
           # Recover best validation result
           print('Reason: early stopping.')
-          print('Recovering Best Validation Performance @ (Epoch %i, Step %i).' % (best_epoch, best_step,))
-          print('Reco_loss: %.3f.' % best_val_reco)
-          self.load( best_model_temp_path )
+          print('Recovering Best Validation Performance @ (Epoch %i, Step %i).' % (lc.best_epoch, best_step,))
+          print('Reco_loss: %.3f.' % lc.best_val_reco)
+          self.load( self._save_model_at_path, val = True )
           skipFinalVal = True
         elif isinstance( exc_val, BreakDueToUpdates ):
           print('Reason: max steps.')
@@ -201,33 +243,38 @@ class TrainBase(MaskModel):
         if isinstance( exc_val, BreakDueToNonFinite ):
           print('Reason: found non-finite value!!')
         raise exc_val
-      if val_dataset is not None and self._loss_fcn:
+      if self.data_sampler.sampler_from_val_ds is not None and self._loss_fcn:
         if not skipFinalVal:
           if not evaluatedVal:
-            val_loss_dict = self._loss_fcn( val_dataset[0], val_dataset[1] )
-            val_loss_dict['step'] = step
-            self._append_loss(val_loss_record, val_loss_dict, keys = self._val_lkeys)
-          if val_loss_dict[self.early_stopping_key] < best_val_reco:
-            best_val_reco = val_loss_dict[self.early_stopping_key]
-            best_step = step; best_epoch = epoch 
+            val_loss_dict = self._loss_fcn( self.data_sampler.val )
+            val_loss_dict['step'] = lc.step
+            self._append_loss(lc.val_loss_record, val_loss_dict, keys = self._val_lkeys)
+          if val_loss_dict[self.early_stopping_key] < lc.best_val_reco:
+            lc.best_val_reco = val_loss_dict[self.early_stopping_key]
+            best_step = lc.step; lc.best_epoch = lc.epoch 
           else:
-            print('Recovering Best Validation Performance @ (Epoch %i, Step %i).' % (best_epoch, best_step,))
-            print('Reco_loss: %.3f.' % (best_val_reco))
-            self.load( best_model_temp_path )
-    self.save( overwrite = True )
+            print('Recovering Best Validation Performance @ (Epoch %i, Step %i).' % (lc.best_epoch, best_step,))
+            print('Reco_loss: %.3f.' % (lc.best_val_reco))
+            self.load(  self._save_model_at_path, val = True )
+    self.save( overwrite = True
+             , locals_data = lc )
     # Compute final performance:
     final_performance = {}
     if self._loss_fcn:
+      # FIXME determinist
       final_performance['trn'] = self._loss_fcn( determinist_train_dataset[0] , determinist_train_dataset[1] )
-      if val_dataset is not None:
-        final_performance['val'] = self._loss_fcn( val_dataset[0], val_dataset[1] )
+      if self.data_sampler.val is not None:
+        final_performance['val'] = self._loss_fcn( self.data_sampler.sampler_from_val_ds )
         final_performance['val']['best_step'] = best_step
-        final_performance['val']['best_epoch'] = best_epoch
+        final_performance['val']['best_epoch'] = lc.best_epoch
       else:
         final_performance['val'] = dict()
-    return { 'train_record' : loss_record
-           , 'val_record' : val_loss_record
-           , 'final_performance' : final_performance }
+    loss_data = { 'train_record' : lc.loss_record
+                , 'val_record' : lc.val_loss_record
+                , 'final_performance' : final_performance }
+    self.save( save_models_and_optimizers = False
+             , loss_data = loss_data)
+    return loss_data
 
   def loss_per_dataset(self, x, mask
       , x_val = None, mask_val = None 
@@ -239,15 +286,68 @@ class TrainBase(MaskModel):
            , 'tst' : fcn(x_tst,mask_tst) if x_tst is not None else {} 
            }
 
-  def save(self, overwrite = False, output_file = None ):
-    if output_file is None:
-      output_file = self._result_file
-    for k, m in self._model_dict.items():
-      m.save_weights( output_file + '_' + k, overwrite )
+  def save(self, overwrite = False, save_models_and_optimizers = True, val = False, loss_data = None, locals_data = None ):
+    # Create folder if it does not exist
+    if not os.path.exists(self._save_model_at_path):
+      os.makedirs(self._save_model_at_path)
+    if save_models_and_optimizers:
+      for k, m in self._model_dict.items():
+        if val: k += '_bestval'
+        #m.save_weights( os.path.join( self._save_model_at_path, k), overwrite )
+        k +=  '.npz'
+        np.savez( os.path.join( self._save_model_at_path, k), m.get_weights() )
+      for k, m in self._optimizer_dict.items():
+        k += '_opt'
+        if val: k += '_bestval'
+        k +=  '.npz'
+        np.savez( os.path.join( self._save_model_at_path, k), m.get_weights() )
+    if loss_data is not None:
+      np.savez(os.path.join( self._save_model_at_path, 'loss.npz'), **loss_data)
+    if locals_data is not None:
+      np.savez(os.path.join( self._save_model_at_path, 'locals.npz'), **locals_data.__dict__ )
 
-  def load(self, path):
-    for k, m in self._model_dict.items():
-      m.load_weights( path + '_' + k)
+  def load(self, path, val = False, return_loss = False, return_locals = False, keys = None ):
+    if keys is None:
+      keys = self._model_dict.keys()
+    if not(return_locals or return_loss):
+      for k in self._model_dict.keys():
+        m = self._model_dict[k]
+        o = self._optimizer_dict[k]
+        print("Loading %s optimizer weights..." % k)
+        try:
+          zero_grads = [tf.zeros_like(w) for w in m.trainable_variables]
+          saved_vars = [tf.identity(w) for w in m.trainable_variables]
+          o.apply_gradients(zip(zero_grads, m.trainable_variables))
+          ko = k; ko += '_opt'
+          if val: ko += '_bestval'
+          ko +=  '.npz'
+          weights = np.load( os.path.join( path, ko ), allow_pickle = True )['arr_0']
+          o.set_weights( weights )
+        except FileNotFoundError:
+          print("Failed! Not recovering optimizer state!")
+        print("Loading %s weights..." % k)
+        km = k
+        if val: 
+          km += '_bestval'
+        km +=  '.npz'
+        try:
+          weights = np.load( os.path.join( path, km ), allow_pickle = True )['arr_0']
+          m.set_weights( weights )
+        except FileNotFoundError:
+          km = k
+          if val: 
+            km += '_bestval'
+          m.load_weights( os.path.join( path, k) )
+        #m.compile()
+      print("Successfully loaded previous state.")
+    if return_loss:
+      loss_data_path = os.path.join( path, 'loss.npz' )
+      raw_data = dict(**np.load( loss_data_path, allow_pickle=True))
+      return self._treat_numpy_data( raw_data )
+    if return_locals:
+      locals_data_path = os.path.join( path, 'locals.npz' )
+      raw_data = dict(**np.load( locals_data_path, allow_pickle=True))
+      return self._treat_numpy_data( raw_data )
 
   def plot_model(self, model_name, *args, **kw):
     if model_name in self._model_dict:
@@ -255,6 +355,35 @@ class TrainBase(MaskModel):
       return tf.keras.utils.plot_model(model, *args, **kw)
     else:
       raise KeyError( "%s is not a valid model key. Available models are: %s" % (model_name, self._model_dict.keys()))
+
+  def _treat_numpy_data( self, raw_loss_data ):
+    for k, m in raw_loss_data.items():
+      raw_loss_data[k] = m.item()
+    return raw_loss_data
+
+  def _plot_train(self, loss_record):
+    from IPython.display import display, clear_output
+    import matplotlib.pyplot as plt
+    if not hasattr(self,"_train_fig"):
+      self._train_fig, self._train_ax = plt.subplots()
+      first = True
+    else:
+      first = False
+      self._train_ax.cla()
+    steps = np.array(loss_record['step'])
+    for k, v in loss_record.items():
+      if k == "step":
+        continue
+      v = np.array(v)
+      idx = np.where(np.isfinite(v))[0]
+      self._train_ax.plot(steps[idx],v[idx],label=k)
+    self._train_ax.legend()
+    plt.xlabel("#Parameter Updates")
+    plt.ylabel("Batch Total Cost")
+    plt.tight_layout()
+    plt.autoscale(enable=True, axis='x', tight=True)
+    clear_output(wait = True)
+    display(self._train_fig)
 
   def _append_loss(self, loss_record, loss_dict, keys = None):
     if keys is None:
@@ -265,6 +394,17 @@ class TrainBase(MaskModel):
       else:
         loss_record[k].append(np.nan)
 
+  def _replace_nans_with_last_report( self, loss_dict, loss_record, keys = None ):
+    if keys is None:
+      keys = self._lkeys
+    for k in keys:
+      if k not in loss_dict or not np.isfinite(loss_dict[k]):
+        if k not in loss_record: continue
+        data = loss_record[k]
+        idx = np.where(np.isfinite(data))[0]
+        if len(idx):
+          loss_dict[k] = data[idx[-1]]
+
   def _accumulate_loss_dict( self, acc_dict, c_dict):
     for k in c_dict.keys():
       val = c_dict[k].numpy() if hasattr(c_dict[k],"numpy") else c_dict[k]
@@ -273,8 +413,8 @@ class TrainBase(MaskModel):
       else:
         acc_dict[k] = val
 
-  def _train_base(self, epoch, step, sample_batch, mask_batch):
-    loss_dict = self._train_step(sample_batch, mask_batch)
+  def _train_base(self, epoch, step, sample_batch):
+    loss_dict = self._train_step(sample_batch)
     return loss_dict
 
   def _parse_train_loss(self, train_loss, prefix = None):
@@ -305,7 +445,7 @@ class TrainBase(MaskModel):
     perc = min(perc,100.)
     perc_str = ("%2.1f%%" % perc) if perc >= 0. else '??.?%%'
     print(('Epoch: %i. Steps: %i. Time: %s. Training %s complete. ' % (epoch, step, train_time, perc_str)) + 
-      '; '.join([("%s: %.3f" % (k, v)) for k, v in loss_dict.items()])
+      '; '.join([("%s: %.3f" % (k, v)) for k, v in loss_dict.items() if k is not 'step'])
     )
     if val_loss_dict:
       print(('Validation (Step %i): ' % (val_loss_dict['step'])) +

@@ -15,8 +15,8 @@ class Wasserstein_GAN(DecoderGenerator):
   def __init__(self, data_sampler, **kw):
     super().__init__(data_sampler, **kw)
     self._tf_call_kw           = retrieve_kw(kw, 'tf_call_kw',           {}                                                         )
-    self._use_gradient_penalty = retrieve_kw(kw, 'use_gradient_penalty', True                                                       )
-    self._grad_weight          = tf.constant( retrieve_kw(kw, 'grad_weight',          10.0                                          ) )
+    self._use_lipschitz_penalty = retrieve_kw(kw, 'use_gradient_penalty', True                                                      )
+    self._grad_weight          = tf.constant( retrieve_kw(kw, 'grad_weight',          10.0                                        ) )
     self._lkeys |= {"lipschitz"}
 
   def latent_dim(self):
@@ -33,7 +33,11 @@ class Wasserstein_GAN(DecoderGenerator):
     return tf.reduce_mean(y_true) - tf.reduce_mean(y_pred)
 
   @tf.function
-  def sample_latent_data(self, nsamples):
+  def sample_generator_input(self, nsamples):
+    return self.sample_latent(nsamples)
+
+  @tf.function
+  def sample_latent(self, nsamples):
     return tf.random.normal((nsamples, self._latent_dim))
 
   @tf.function
@@ -42,13 +46,17 @@ class Wasserstein_GAN(DecoderGenerator):
 
   @tf.function
   def generate(self, nsamples, **call_kw):
-    return self.transform( self.sample_latent_data( nsamples ),**call_kw)
-
+    return self.transform( self.sample_generator_input( nsamples ),**call_kw)
 
   @tf.function
-  def _gradient_penalty(self, x, x_hat):
+  def _compute_u_hat(self, x, x_hat):
     epsilon = tf.random.uniform((x.shape[0], 1, 1), 0.0, 1.0)
     u_hat = epsilon * x + (1 - epsilon) * x_hat
+    return u_hat
+
+  @tf.function
+  def _lipschitz_penalty(self, x, x_hat):
+    u_hat = self._compute_u_hat(x, x_hat)
     with tf.GradientTape() as penalty_tape:
       penalty_tape.watch(u_hat)
       func = self.critic(u_hat)
@@ -67,8 +75,8 @@ class Wasserstein_GAN(DecoderGenerator):
   @tf.function
   def _get_critic_loss( self, samples, fake_samples, real_output, fake_output ):
     critic_lipschitz = tf.multiply(self._grad_weight
-        , self._gradient_penalty(samples, fake_samples)
-        ) if self._use_gradient_penalty else 0
+        , self._lipschitz_penalty(samples, fake_samples)
+        ) if self._use_lipschitz_penalty else 0
     critic_loss = tf.add( self.wasserstein_loss(real_output, fake_output), critic_lipschitz )
     return critic_loss, critic_lipschitz
 

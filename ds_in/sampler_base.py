@@ -19,7 +19,7 @@ class SamplerBase(object):
     self._test_frac                  = retrieve_kw(kw, "test_frac",                  .2                                   )
     self._shuffle                    = retrieve_kw(kw, "shuffle",                    True                                 )
     self._shuffle_kwargs             = retrieve_kw(kw, "shuffle_kwargs",             {}                                   )
-    self._batch_size                 = retrieve_kw(kw, "batch_size",                 128                                  )
+    self._batch_size                 = tf.constant( retrieve_kw(kw, "batch_size",    128 ), dtype = tf.int64              )
     if not "reshuffle_each_iteration" in self._shuffle_kwargs:
       self._shuffle_kwargs["reshuffle_each_iteration"] = False
     self._pp = manager.pre_proc
@@ -37,9 +37,8 @@ class SamplerBase(object):
   def sampler_from_test_ds(self):
     return self._make_dataset(self.test_df)
 
-  def sample(self, ds = "val"):
+  def sample(self, n_samples = 1, ds = "val"):
     """Get and cache an example batch of `inputs, labels` for plotting."""
-    # No example batch was found, so get one from the `.train` dataset
     if ds == "train":
       f_iter = self._single_sample_cached_train_iter
     elif ds == "val":
@@ -48,12 +47,30 @@ class SamplerBase(object):
       f_iter = self._single_sample_cached_test_iter
     else:
       raise RuntimeError("unknown dataset %s.", ds)
-    try:
-      result = next(f_iter)
-    except StopIteration:
-      f.cache_clear()
-      result = next(f_iter)
-    return result
+    samples = []
+    for _ in range(n_samples):
+      try:
+        sample = next(f_iter)
+      except StopIteration:
+        f.cache_clear()
+        sample = next(f_iter)
+      samples.append(sample)
+    if n_samples > 1:
+      if isinstance(sample, dict):
+        ret_samples = {}
+        for k in sample.keys():
+          if isinstance(sample[k],(tuple,list)):
+            ret_samples[k] = [tf.stack([s[k][i] for s in samples]) for i in range(len(sample[k]))]
+          else:
+            ret_samples[k] = tf.stack([s[k] for s in samples])
+        samples = ret_samples
+      elif isinstance(sample, (tuple,list)):
+        samples = [tf.stack([s[i] for s in samples]) for i in range(len(sample))]
+      else:
+        samples = tf.stack(samples)
+    else:
+      samples = samples[0]
+    return samples
 
   @_CacheStorage.cached_property()
   def _single_sample_cached_train_iter(self):

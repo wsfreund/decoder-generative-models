@@ -43,6 +43,8 @@ class TrainBase(MaskModel):
     super().__init__()
     self.data_sampler = data_sampler
     ## Configuration
+    # Function to extract information from samples
+    self.sample_parser_fcn         = retrieve_kw(kw,  'sample_parser_fcn',    None                                                      )
     # training_kw: propagate "training = True" for dropout
     self._training_kw              = retrieve_kw(kw, 'training_kw',          {'training' : True}                                        )
     # Cycle for computing validation steps
@@ -85,8 +87,6 @@ class TrainBase(MaskModel):
     self._save_model_at_path       = retrieve_kw(kw, 'save_model_at_path',   "trained_model"                                            )
     # Batch size used for model evaluation using full dataset. When None, use the full dataset size.
     self._eval_batch_size          = retrieve_kw(kw, 'eval_batch_size',      None                                                       )
-    # Function to extract information from samples
-    self._sample_parser_fcn        = retrieve_kw(kw,  'sample_parser_fcn',    None                                                      )
     # Whether to apply gradient clipping
     self._use_grad_clipping        = tf.constant( retrieve_kw(kw, 'use_grad_clipping', False  ) )
     # Gradient clipping function
@@ -133,8 +133,8 @@ class TrainBase(MaskModel):
       while (lc.epoch < self._max_epoches if self._max_epoches else True):
         alreadyPrintedEpoch = alreadySavedEpoch = False
         for sample_batch in self.data_sampler.sampler_from_train_ds:
-          if self._sample_parser_fcn is not None:
-            sample_batch = self._sample_parser_fcn(sample_batch)
+          if self.sample_parser_fcn is not None:
+            sample_batch = self.sample_parser_fcn(sample_batch)
           evaluatedVal = False
           loss_dict = self._train_base(lc.epoch, lc.step, sample_batch)
           loss_dict = self._parse_train_loss( loss_dict, self._val_prefix )
@@ -293,52 +293,43 @@ class TrainBase(MaskModel):
     if save_models_and_optimizers:
       for k, m in self._model_dict.items():
         if val: k += '_bestval'
-        #m.save_weights( os.path.join( self._save_model_at_path, k), overwrite )
         k +=  '.npz'
-        np.savez( os.path.join( self._save_model_at_path, k), m.get_weights() )
+        self._save_model( os.path.join(self._save_model_at_path, k), m )
       for k, m in self._optimizer_dict.items():
         k += '_opt'
         if val: k += '_bestval'
         k +=  '.npz'
-        np.savez( os.path.join( self._save_model_at_path, k), m.get_weights() )
+        self._save_optimizer( os.path.join(self._save_model_at_path,k), m )
     if loss_data is not None:
       np.savez(os.path.join( self._save_model_at_path, 'loss.npz'), **loss_data)
     if locals_data is not None:
       np.savez(os.path.join( self._save_model_at_path, 'locals.npz'), **locals_data.__dict__ )
+
+  def _save_model( self, key, model ):
+    np.savez( key, model.get_weights() )
+
+  def _save_optimizer( self, key, optimizer ):
+    np.savez( key, optimizer.get_weights() )
 
   def load(self, path, val = False, return_loss = False, return_locals = False, keys = None ):
     if keys is None:
       keys = self._model_dict.keys()
     if not(return_locals or return_loss):
       for k in self._model_dict.keys():
-        m = self._model_dict[k]
-        o = self._optimizer_dict[k]
-        print("Loading %s optimizer weights..." % k)
+        model = self._model_dict[k]
+        optimizer = self._optimizer_dict[k]
         try:
-          zero_grads = [tf.zeros_like(w) for w in m.trainable_variables]
-          saved_vars = [tf.identity(w) for w in m.trainable_variables]
-          o.apply_gradients(zip(zero_grads, m.trainable_variables))
-          ko = k; ko += '_opt'
+          ko = k
+          ko += '_opt'
           if val: ko += '_bestval'
           ko +=  '.npz'
-          weights = np.load( os.path.join( path, ko ), allow_pickle = True )['arr_0']
-          o.set_weights( weights )
+          self._load_optimizer(os.path.join(path,ko), optimizer, model)
         except FileNotFoundError:
-          print("Failed! Not recovering optimizer state!")
-        print("Loading %s weights..." % k)
-        km = k
+          print("Warning: Not recovering optimizer state.")
         if val: 
-          km += '_bestval'
-        km +=  '.npz'
-        try:
-          weights = np.load( os.path.join( path, km ), allow_pickle = True )['arr_0']
-          m.set_weights( weights )
-        except FileNotFoundError:
-          km = k
-          if val: 
-            km += '_bestval'
-          m.load_weights( os.path.join( path, k) )
-        #m.compile()
+          k += '_bestval'
+        k +=  '.npz'
+        self._load_model(os.path.join(path,k), model)
       print("Successfully loaded previous state.")
     if return_loss:
       loss_data_path = os.path.join( path, 'loss.npz' )
@@ -348,6 +339,23 @@ class TrainBase(MaskModel):
       locals_data_path = os.path.join( path, 'locals.npz' )
       raw_data = dict(**np.load( locals_data_path, allow_pickle=True))
       return self._treat_numpy_data( raw_data )
+
+  def _load_model(self, key, model):
+    print("Loading %s weights..." % key)
+    try:
+      weights = np.load( key, allow_pickle = True )['arr_0']
+      model.set_weights( weights )
+    except FileNotFoundError:
+      model.load_weights( key )
+    #model.compile()
+
+  def _load_optimizer(self, key, optimizer, model):
+    print("Loading %s optimizer weights..." % key)
+    zero_grads = [tf.zeros_like(w) for w in model.trainable_variables]
+    saved_vars = [tf.identity(w) for w in model.trainable_variables]
+    optimizer.apply_gradients(zip(zero_grads, model.trainable_variables))
+    weights = np.load( key, allow_pickle = True )['arr_0']
+    optimizer.set_weights( weights )
 
   def plot_model(self, model_name, *args, **kw):
     if model_name in self._model_dict:

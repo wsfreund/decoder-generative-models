@@ -15,6 +15,8 @@ except ImportError:
   from .sampler_base import SamplerBase
   from .data_manager import TimeseriesMetadata
 
+dev = False
+
 class _CacheStorage(CleareableCache):
   cached_functions = []
 
@@ -61,7 +63,7 @@ class WindowSampler(SamplerBase):
     else:
       self._past_window_size = sum(past_widths)
       self._past_widths = past_widths
-      self._past_widths_up_to_mark_zero = list(np.cumsum(past_widths, dtype=np.int32))
+      self._past_widths_up_to_mark_zero = list(np.cumsum(past_widths, dtype=np.int64))
     #self.label_width = label_width
     self._cycle_shift = cycle_shift
     self._cycle_width = cycle_width
@@ -81,6 +83,8 @@ class WindowSampler(SamplerBase):
       shuffle_buffer_size_window = TimeseriesMetadata.days_per_year #Metadata.days_per_month*3
     else:
       shuffle_buffer_size_window = TimeseriesMetadata.days_per_year
+    if dev:
+      shuffle_buffer_size_window = TimeseriesMetadata.days_per_week
     self._shuffle_buffer_size_window = shuffle_buffer_size_window
     return
 
@@ -144,7 +148,7 @@ class WindowSampler(SamplerBase):
       if feature_plot_col_index is not None or self._sample_from_marginals:
         slices = [d[:,:,feature_plot_col_index] for d in inputs_dict["slices"]]
         for i, (idxs, s, input_opts) in enumerate(zip(self.all_past_indices, slices, input_cycler)):
-          plt.plot(delta[idxs], np.squeeze(self._pp.inverse_transform(s))
+          plt.plot(delta[idxs], np.squeeze(self._pp.inverse_transform(s)[0,:,:])
               , label='Past period [%d]' % i, markersize=2
               , markeredgewidth=1, **input_opts, alpha = 0.7)
       for c, cycle_opts in zip(range(self.n_cycles), cycle_cycler):
@@ -190,7 +194,7 @@ class WindowSampler(SamplerBase):
         sequence_length=self.total_window_size,
         sequence_stride=self._sequence_stride,
         shuffle=False,
-        batch_size=1,)
+        batch_size=tf.constant(1,dtype=tf.int64),)
     # XXX Hack to remove batching
     ds = ds._input_dataset
     if self._sample_from_marginals:

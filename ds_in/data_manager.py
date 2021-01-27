@@ -72,15 +72,16 @@ class DataManager(object):
       os.path.expandvars("$HOME/Google Drive File Stream/Mon Drive/Notebooks/psr_renewable/datasets"),
       ]
 
-  def __init__( self, basefile ):
+  def __init__( self, basefile, shuffle_on_first_read = False ):
     self._basefile = basefile
+    self._shuffle_on_first_read = shuffle_on_first_read
 
   def __enter__(self):
     if 'df' in self.__dict__:
       return self
     self.autolocate()
-    data_path = self._get_data_path()
-    self._read( data_path )
+    self.data_path = self._get_data_path()
+    self._read( self.data_path )
     return self
 
   def __exit__(self, exc_type, exc_value, traceback):
@@ -119,6 +120,9 @@ class DataManager(object):
       self.df = pd.read_csv( data_path, header = None )
       self.df.columns = map(str,self.df.columns) # ensure that columns are strings
       self.df.to_feather(data_path[:-4]+'.ft')
+      if self._shuffle_on_first_read:
+        # TODO shuffle on first read for non time series data
+        raise NotImplementedError("Shuffle on first read is not implemented")
     elif self.format == ".ft":
       self.df = pd.read_feather( data_path )
     return self.df

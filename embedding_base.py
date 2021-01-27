@@ -145,7 +145,7 @@ class ModelWithEmbeddings( BeyondNumericalDataModel ):
     self._output_head_hidden_layer_master_switch = output_head_hidden_layer_master_switch 
     self._output_head_bias_statistics_master_switch = output_head_bias_statistics_master_switch
 
-  def _create_initial_layers( self, train_data, train_mask, embedding_config_dict = NotSet, embedding_size_fcn = NotSet ):
+  def _create_initial_layers( self, embedding_config_dict = NotSet, embedding_size_fcn = NotSet ):
     if not embedding_config_dict:
       embedding_config_dict = { k : EmbeddingConfig( input_info = v, embedding_size_fcn = embedding_size_fcn ) for k, v in self._input_info_dict.items() }
     self._embedding_config_dict = embedding_config_dict
@@ -230,7 +230,7 @@ class ModelWithEmbeddings( BeyondNumericalDataModel ):
     self._has_numerical = tf.constant( len(numerical_mask_slice) > 0, tf.bool )
     return flatten_input, model_input
 
-  def _create_final_layers( self, final_codes, train_data, train_mask, output_head_config_dict = NotSet
+  def _create_final_layers( self, final_codes, output_head_config_dict = NotSet
       , hidden_layer_activation_type = NotSet
       , output_head_hidden_model_config_fcn = NotSet
       , use_batch_normalization = False
@@ -277,10 +277,10 @@ class ModelWithEmbeddings( BeyondNumericalDataModel ):
             , **oConf.output_layer_kwargs
             )(code)
       # Fix marginal statistics using bias?
-      if train_data is not None and oConf.use_marginal_statistics and self._output_head_hidden_layer_master_switch:
+      if oConf.use_marginal_statistics and self._output_head_hidden_layer_master_switch:
         oConf.use_default_marginal_statistics_bias( 
-            train_data[:,n_variables:n_variables+info.n_variables],
-            self._expand_mask( train_mask )[:,n_variables:n_variables+info.n_variables]
+            self._data_sampler.train_df[:,n_variables:n_variables+info.n_variables],
+            self._expand_mask( self._data_sampler.train_mask_df )[:,n_variables:n_variables+info.n_variables]
         )
         output = layers.Dense(info.n_variables
             , name = name + "_marginal_statistics_fixer"
@@ -319,3 +319,8 @@ class ModelWithEmbeddings( BeyondNumericalDataModel ):
     del(self._input_end_pos)
     return flatten_output
 
+  def _create_mask_from_slice(self, s):
+    mask = np.zeros((1, self._n_mask_inputs), dtype=np.bool)
+    for i in s:
+      mask[:,i] = True
+    return tf.constant(mask, dtype=tf.bool), [len(s),]

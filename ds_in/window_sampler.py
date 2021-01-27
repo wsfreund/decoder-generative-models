@@ -2,45 +2,57 @@ import numpy as np
 import tensorflow as tf
 import sklearn
 import datetime
-import matplotlib.pyplot as plt
-import seaborn as sns
 import copy
 
-try:
-  from misc import *
-  from sampler_base import SamplerBase
-  from data_manager import TimeseriesMetadata
-except ImportError:
-  from .misc import *
-  from .sampler_base import SamplerBase
-  from .data_manager import TimeseriesMetadata
+from ..misc import *
+from .sampler_base import SamplerBase, SpecificFlowSamplingOpts
+from .data_manager import TimeseriesMetadata
 
-dev = False
+class SpecificFlowWindowSamplingOpts(SpecificFlowSamplingOpts):
+  """
+  Allows to specify different sampling options for the same dataset
+  """
+  def set_unset_to_default(self, sampler, df):
+    super().set_unset_to_default( sampler, df )
+    if not "buffer_size" in self.shuffle_kwargs:
+      if sampler.shuffle_buffer_size_window is NotSet:
+        shuffle_buffer_size_window = datetime.timedelta(days=TimeseriesMetadata.days_per_year)
+      else:
+        assert isinstance(sampler.shuffle_buffer_size_window, datetime.timedelta)
+        shuffle_buffer_size_window = sampler.shuffle_buffer_size_window
+      # Compute the buffer size
+      val = int(np.round( shuffle_buffer_size_window
+                        / (sampler._sequence_stride*sampler._time_step)
+               ))
+      # Increase buffer size when sampling from marginals
+      if sampler._sample_from_marginals:
+        val *= len(sampler._features)
+      if self.batch_size is not None and val < self.batch_size * 8:
+        val = self.batch_size * 8
+      self.shuffle_kwargs["buffer_size"] = val
 
 class _CacheStorage(CleareableCache):
   cached_functions = []
 
 class WindowSampler(SamplerBase):
 
-  def __init__(self
-      , cycle_width, cycle_shift
-      , past_widths, overlaps
-      , manager, **kw ):
+  def __init__(self, manager, cycle_width, cycle_shift, **kw ):
     """
     TODO Help
     :param manager: a data manager instance 
-
-    If running out of memory, increase sequence stride or reduce the
-    shuffle_buffer_size_window
     """
-    SamplerBase.__init__(self, manager, **kw)
-    features                   = retrieve_kw(kw, "features",                   slice(None)                          )
-    sample_from_marginals      = retrieve_kw(kw, "sample_from_marginals",      False                                )
-    keep_marginal_axis         = retrieve_kw(kw, "keep_marginal_axis",         True                                 )
-    past_widths_wrt_present    = retrieve_kw(kw, "past_widths_wrt_present",    True                                 )
-    shuffle_buffer_size_window = retrieve_kw(kw, "shuffle_buffer_size_window", None                                 )
-    sequence_stride            = retrieve_kw(kw, "sequence_stride",            1                                    )
-    n_cycles                   = retrieve_kw(kw, "n_cycles",                   1                                    )
+    if "specific_flow_sampling_opt_class" not in kw:
+      kw["specific_flow_sampling_opt_class"] = SpecificFlowWindowSamplingOpts
+    super().__init__(manager, **kw)
+    self.shuffle_buffer_size_window = retrieve_kw(kw, "shuffle_buffer_size_window" )
+    self._sample_from_marginals     = retrieve_kw(kw, "sample_from_marginals",      False                                )
+    self._keep_marginal_axis        = retrieve_kw(kw, "keep_marginal_axis",         True                                 )
+    self._sequence_stride           = retrieve_kw(kw, "sequence_stride",            1                                    )
+    self._past_widths_wrt_present   = retrieve_kw(kw, "past_widths_wrt_present",    True                                 )
+    self._overlaps                  = retrieve_kw(kw, "overlaps",                   None                                 )
+    features                        = retrieve_kw(kw, "features",                   []                                   )
+    past_widths                     = retrieve_kw(kw, "past_widths",                None                                 )
+    n_cycles                        = retrieve_kw(kw, "n_cycles",                   1                                    )
     del kw
 
     # Strip information from dataset
@@ -48,26 +60,29 @@ class WindowSampler(SamplerBase):
     self._time_step = manager.time_step
 
     # Work out the features
-    self._features = features if features != slice(None) else manager.df.columns.to_numpy()
+    self._features = features if features else manager.df.columns.to_numpy()
     #self.labels = labels if labels != slice(None) else manager.df.columns.to_numpy()
     self._feature_column_map = {l: i for i, l in enumerate(self._features)}
     #self.label_column_map = {l: i for i, l in enumerate(self.labels)}
     self._column_map = {name: i for i, name in enumerate(manager.df.columns)}
 
     # Work out the window parameters
-    self._past_widths_wrt_present = past_widths_wrt_present 
-    if self._past_widths_wrt_present:
-      self._past_window_size = max(past_widths)
-      self._past_widths = np.array(past_widths) - np.array([0] + past_widths[:-1])
-      self._past_widths_up_to_mark_zero = past_widths
-    else:
-      self._past_window_size = sum(past_widths)
+    if past_widths is None:
       self._past_widths = past_widths
-      self._past_widths_up_to_mark_zero = list(np.cumsum(past_widths, dtype=np.int64))
+      self._past_window_size = cycle_width - cycle_shift
+      self._past_widths_up_to_mark_zero = []
+    else:
+      if self._past_widths_wrt_present:
+        self._past_window_size = max(past_widths)
+        self._past_widths = np.array(past_widths) - np.array([0] + past_widths[:-1])
+        self._past_widths_up_to_mark_zero = past_widths
+      else:
+        self._past_window_size = sum(past_widths)
+        self._past_widths = past_widths
+        self._past_widths_up_to_mark_zero = list(np.cumsum(past_widths, dtype=np.int64))
     #self.label_width = label_width
     self._cycle_shift = cycle_shift
     self._cycle_width = cycle_width
-    self._overlaps = overlaps
 
     #self.label_start = self.total_window_size - self.label_width
     #self.labels_slice = slice(self.label_start, None)
@@ -75,17 +90,6 @@ class WindowSampler(SamplerBase):
 
     # Compute the window width for n_cycles
     self.update_n_cycles(n_cycles)
-
-    self._sequence_stride = sequence_stride
-    self._sample_from_marginals = sample_from_marginals
-    self._keep_marginal_axis = keep_marginal_axis
-    if self._sample_from_marginals and shuffle_buffer_size_window is None:
-      shuffle_buffer_size_window = TimeseriesMetadata.days_per_year #Metadata.days_per_month*3
-    else:
-      shuffle_buffer_size_window = TimeseriesMetadata.days_per_year
-    if dev:
-      shuffle_buffer_size_window = TimeseriesMetadata.days_per_week
-    self._shuffle_buffer_size_window = shuffle_buffer_size_window
     return
 
   def clear_cache(self):
@@ -97,30 +101,36 @@ class WindowSampler(SamplerBase):
     _CacheStorage.clear_cached_functions()
     # Compute windows
     self.n_cycles = n_cycles
-    self.present_mark_step = self._past_window_size+1
+    self.present_mark_step = self._past_window_size+1 if self._past_widths is not None else 0
     self.future_window_size = n_cycles*self._cycle_shift
     self.total_window_size  = self._past_window_size + self.future_window_size
 
     # Compute slices
     self.full_past_slice = slice(0, self.total_window_size)
     self.full_window_indices = np.arange(self.total_window_size)[self.full_past_slice]
-    if self._past_widths_wrt_present:
-      edges = [0] + list(reversed(np.abs(np.array([0] + self._past_widths_up_to_mark_zero[:-1]) - np.ones_like(self._past_widths_up_to_mark_zero)*self._past_window_size)))
-    else:
-      edges = np.cumsum([0] + list(reversed(self._past_widths)))
     self.sliding_window_cycle_slice = slice(-self._cycle_width,None)
-    self.all_past_slices = [slice(int(wstart), int(wend+g)) for wstart, wend, g in 
-        # NOTE We reverse twice because it is easier to implement the algorithm
-        # in reverse order, but it is better to keep the input slices on the
-        # original order
-        zip( reversed(edges[:-1])
-           , reversed(edges[1:])
-           , self._overlaps)]
-    self.all_past_indices = [self.full_window_indices[s] for s in self.all_past_slices]
+    if self._past_widths is not None:
+      if self._past_widths_wrt_present:
+        edges = [0] + list(reversed(np.abs(np.array([0] + self._past_widths_up_to_mark_zero[:-1]) - np.ones_like(self._past_widths_up_to_mark_zero)*self._past_window_size)))
+      else:
+        edges = np.cumsum([0] + list(reversed(self._past_widths)))
+      self.all_past_slices = [slice(int(wstart), int(wend+g)) for wstart, wend, g in 
+          # NOTE We reverse twice because it is easier to implement the algorithm
+          # in reverse order, but it is better to keep the input slices on the
+          # original order
+          zip( reversed(edges[:-1])
+             , reversed(edges[1:])
+             , self._overlaps)]
+      self.all_past_indices = [self.full_window_indices[s] for s in self.all_past_slices]
+    else:
+      self.all_past_slices = []
+      self.all_past_indices = []
 
 
   def plot(self, plot_col = None, model = None,  ds = "val", n_examples = 3):
     from cycler import cycler
+    import matplotlib.pyplot as plt
+    import seaborn as sns
     plt.figure(figsize=(12, 8))
     # These allow to choose which farm to sample from
     if plot_col is None:
@@ -144,21 +154,24 @@ class WindowSampler(SamplerBase):
     delta = (np.array(self.full_window_indices)-self.present_mark_step)
     for n in range(n_examples):
       plt.subplot(n_examples, 1, n+1)
-      inputs_dict = self.sample( ds = ds )
+      inputs = self.sample( ds = ds )
+      # Plot slices
       if feature_plot_col_index is not None or self._sample_from_marginals:
-        slices = [d[:,:,feature_plot_col_index] for d in inputs_dict["slices"]]
+        slices = [d[:,:,feature_plot_col_index] for d in inputs["slices"]] if isinstance(inputs, dict) else []
         for i, (idxs, s, input_opts) in enumerate(zip(self.all_past_indices, slices, input_cycler)):
           plt.plot(delta[idxs], np.squeeze(self._pp.inverse_transform(s)[0,:,:])
               , label='Past period [%d]' % i, markersize=2
               , markeredgewidth=1, **input_opts, alpha = 0.7)
+      # Plot cycles
       for c, cycle_opts in zip(range(self.n_cycles), cycle_cycler):
-        cycle = inputs_dict["cycle"][c,:,feature_plot_col_index]
+        cycle = inputs["cycle"][c,:,feature_plot_col_index] if isinstance(inputs, dict) else inputs
         if plot_col: plt.ylabel(f'{plot_col}')
         if feature_plot_col_index is not None or self._sample_from_marginals:
           plt.plot(delta[self._cycle_indices(c)], np.squeeze(self._pp.inverse_transform(cycle))
-              , label=('Cycle [%d]' % c) if c in (0,self.n_cycles-1) else '', markersize=2
+              , label=(('Cycle [%d]' % c) if c in (0,self.n_cycles-1) else '') if self.n_cycles>1 else 'Input', markersize=2
               , markeredgewidth=1, alpha = 0.7
               , **cycle_opts)
+        # Plot model outputs
         if model is not None:
           # TODO
           outputs = model(inputs)
@@ -171,6 +184,18 @@ class WindowSampler(SamplerBase):
     plt.xlabel('Time [%s]' % self._date_time.freq)
     return
 
+  @property
+  def has_train_ds(self):
+    return hasattr(self,"train_df")
+
+  @property
+  def has_val_ds(self):
+    return hasattr(self,"val_df")
+
+  @property
+  def has_test_ds(self):
+    return hasattr(self,"test_df")
+
   def _cycle_slice(self, cycle_idx=0):
     end = -(self.n_cycles-(cycle_idx+1))*self._cycle_shift
     start = end - self._cycle_width
@@ -179,15 +204,18 @@ class WindowSampler(SamplerBase):
   def _cycle_indices(self, cycle_idx=0):
     return self.full_window_indices[self._cycle_slice(cycle_idx)]
 
-  def _make_dataset(self, df, batch = True):
+  def _make_dataset( self, df, opts, cache_filepath, memory_cache = False):
+    #start = datetime.datetime.now()
+    #print("Building new dataset...")
     # This will not work if attempting to forecast the past:
     try:
       sklearn.utils.validation.check_is_fitted( self._pp )
     except sklearn.exceptions.NotFittedError:
       self._pp.fit(self.train_df)
-    n_examples, n_dims = df.shape
+    opts.set_unset_to_default( self, df )
     # NOTE This slice on features must be removed when adding support to labels
     data = self._pp.transform( df.loc[:,self._features].to_numpy(dtype=np.float32) )
+    # Create time series windows
     ds = tf.keras.preprocessing.timeseries_dataset_from_array(
         data=data,
         targets=None,
@@ -197,19 +225,23 @@ class WindowSampler(SamplerBase):
         batch_size=tf.constant(1,dtype=tf.int64),)
     # XXX Hack to remove batching
     ds = ds._input_dataset
+    # Cache just after the heavy windowing operation so that it is shared
+    # across each subset, independently of the next configs
+    if cache_filepath:
+      if cache_filepath not in self._cached_filepath_dict:
+        mkdir_p(cache_filepath)
+        ds = ds.cache( cache_filepath )
+        self._cached_filepath_dict[cache_filepath] = ds
+      else:
+        ds = ds.cache()
+        print("Warning: Caching on memory although specified to cache on disk.\nReason: Dataset at '%s' is already currently being cached." % cache_filepath )
     if self._sample_from_marginals:
       ds = self._pattern_sampler(ds)
-    if self._shuffle:
-      shuffle_kwargs = copy.copy(self._shuffle_kwargs)
-      if not "buffer_size" in shuffle_kwargs:
-        # Default is set to shuffle a full year in the buffer
-        val = int(np.round(datetime.timedelta(days=self._shuffle_buffer_size_window)/(self._sequence_stride*self._time_step)))
-        if self._sample_from_marginals:
-          val *= len(self._features)
-        if val < self._batch_size * 8:
-          val = self._batch_size * 8
-        shuffle_kwargs["buffer_size"] = val
-      ds = ds.shuffle(**shuffle_kwargs)
+    if bool(opts.shuffle):
+      ds = ds.shuffle(**opts.shuffle_kwargs)
+    if bool(opts.take_n):
+      ds = ds.take( opts.take_n )
+    # Split windows into cycles
     ds = self._nested_timeseries(
         start_index = 0,
         end_index = self.total_window_size,
@@ -217,9 +249,12 @@ class WindowSampler(SamplerBase):
         sequence_length=self._past_window_size+self._cycle_shift,
         sequence_stride=self._cycle_shift)
     ds = ds.map(self._extract_data)
-    if batch:
-      ds = ds.batch(self._batch_size, drop_remainder = True)
-    # shuffle
+    if opts.batch_size is not None:
+      ds = ds.batch(opts.batch_size, drop_remainder = opts.drop_remainder)
+    if memory_cache:
+      ds = ds.cache()
+    #total_time = datetime.datetime.now() - start
+    #print("Finished building dataset in %s." % total_time)
     return ds
 
   def _extract_data(self, window):
@@ -234,7 +269,10 @@ class WindowSampler(SamplerBase):
     #      axis=-1)
     ##inputs = tf.expand_dims( inputs, axis = 1 )
     #inputs.set_shape([self.n_cycles, self._past_widths, None])
-    return { "cycle" : cycle, "slices" : tuple(slices) }
+    if slices:
+      return { "cycle" : cycle, "slices" : tuple(slices) }
+    else:
+      return cycle
 
   def _pattern_sampler(self, input_dataset):
     from tensorflow.python.data.ops import dataset_ops
@@ -311,23 +349,25 @@ class WindowSampler(SamplerBase):
     # for future data
     # NOTE: If we are going to generalize for future and past data, this needs
     # to be taken into account.
+    # TODO: Perharps it is possible to create the datasets and save them to
+    # avoid computing the shuffling buffer each time
     n = len(df)
     full_train_frac = 1. - test_frac
-    train_frac = 1. - val_frac
+    train_frac      = 1. - val_frac
 
-    full_train_slice = slice(0,int(n*full_train_frac))
-    full_train_df = df[full_train_slice]
-    n_tr = int(n*full_train_frac)
-    train_slice=slice(0,int(n_tr*full_train_frac))
-    self.train_df = full_train_df[train_slice]
+    full_train_slice              = slice(0,int(n*full_train_frac))
+    full_train_df                 = df[full_train_slice]
+    n_tr                          = int(n*full_train_frac)
+    train_slice                   = slice(0,int(n_tr*full_train_frac))
+    self.train_df                 = full_train_df[train_slice]
 
-    self.val_slice=slice(int(n_tr*train_frac),None)
-    self.val_df = full_train_df[self.val_slice]
-    self.val_df.reset_index(drop=True,inplace=True)
+    val_slice                     = slice(int(n_tr*train_frac),None)
+    self.val_df                   = full_train_df[val_slice]
+    self.val_df.reset_index(drop  = True,inplace=True)
 
-    self.test_slice=slice(int(n*(1.-full_train_frac)),None)
-    self.test_df = df[self.test_slice]
-    self.test_df.reset_index(drop=True,inplace=True)
+    test_slice                    = slice(int(n*full_train_frac)+1,None)
+    self.test_df                  = df[test_slice]
+    self.test_df.reset_index(drop = True,inplace=True)
     return
 
   def __repr__(self):

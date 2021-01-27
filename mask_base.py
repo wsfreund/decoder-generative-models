@@ -10,21 +10,38 @@ except ImportError:
 
 class MaskModel(object):
 
+  def _retrieve_data_and_mask( self, ip ):
+    if isinstance(ip, tuple):
+      data, mask = ip
+    elif isinstance(ip, dict):
+      mask, data = ip["mask"], ip["data"]
+    else:
+      data, mask = ip, None
+    return data, mask
+
   @tf.function
   def _mask_multiply(self, val, mask):
+    if mask is None:
+      return val
     return tf.multiply(val, mask)
 
   @tf.function
   def _anti_mask(self, mask, ):
+    if mask is None:
+      return None
     ret = tf.subtract( tf.constant(1.,dtype=tf.float32), mask )
     return ret
 
   @tf.function
   def _anti_mask_multiply(self, val, mask):
-     return tf.multiply(val, self._anti_mask(mask) )
+    if mask is None:
+      return val
+    return tf.multiply(val, self._anti_mask(mask) )
 
   @tf.function
   def _compose(self, orig, star, mask):
+    if mask is None:
+      return orig
     # NOTE: Avoid non-differentiable operations, such as
     #tf.where(tf.equal(mask,tf.constant(1.,dtype=tf.float32)), orig, star)
     pos = self._mask_multiply(orig, mask)
@@ -33,6 +50,8 @@ class MaskModel(object):
 
   @tf.function
   def _reduce_mean_mask( self, tensor, mask ):
+    if mask is None:
+      return tf.reduce_mean( tensor, axis = [0,1], keepdims = False)
     return tf.squeeze( 
       self._reduce_mean_mask_per_example(
           self._reduce_mean_mask_per_feature( tensor, mask )
@@ -42,16 +61,22 @@ class MaskModel(object):
 
   @tf.function
   def _valid_examples( self, mask, keepdims = True, cast_reduce = True ):
+    if mask is None:
+      return None
     if cast_reduce:
       mask = tf.cast( tf.reduce_any( tf.cast( mask, tf.bool ), axis = 1, keepdims = keepdims ) , tf.float32 )
     return tf.reduce_sum( mask, axis = 0, keepdims = keepdims )
 
   @tf.function
   def _valid_features( self, mask, keepdims = True ):
+    if mask is None:
+      return None
     return tf.reduce_sum( mask, axis = 1, keepdims = keepdims )
 
   @tf.function
   def _reduce_mean_mask_per_feature( self, tensor, mask ):
+    if mask is None:
+      return tf.reduce_mean( tensor, axis = 1, keepdims = True)
     # NOTE Reduce mean mask is important to ensure that all examples input the
     # same average contribution to the gradient
     # TODO Check other divides in code
@@ -64,6 +89,8 @@ class MaskModel(object):
 
   @tf.function
   def _reduce_mean_mask_per_example( self, tensor, mask ):
+    if mask is None:
+      return tf.reduce_mean( tensor, axis = 0, keepdims = True )
     # NOTE Reduce mean mask is important to ensure that all examples input the
     # same average contribution to the gradient
     # TODO Check other divides in code
@@ -73,7 +100,7 @@ class MaskModel(object):
           self._mask_multiply( tensor, mask )
       , axis = 0, keepdims = True )
       , self._valid_examples( mask, cast_reduce = False )
-    )
+    ) 
 
   @tf.function
   def _numerically_stable_log(self, x):
@@ -84,9 +111,3 @@ class MaskModel(object):
     f = tf.math.log; safe_f = tf.zeros_like
     safe_x = tf.where(x_in_domain, x, tf.ones_like(x))
     return tf.where(x_in_domain, f(safe_x), safe_f(x))
-
-  def _create_mask_from_slice(self, s):
-    mask = np.zeros((1, self._n_mask_inputs), dtype=np.bool)
-    for i in s:
-      mask[:,i] = True
-    return tf.constant(mask, dtype=tf.bool), [len(s),]

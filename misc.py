@@ -1,4 +1,5 @@
 import functools
+import os
 
 class CleareableCache(object):
   @classmethod
@@ -65,3 +66,7 @@ def fix_model_layers(model):
   ]
   return model
 
+def mkdir_p(path):
+  path = os.path.expandvars( path )
+  if not os.path.exists( path ):
+    os.makedirs(path)

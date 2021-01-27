@@ -17,6 +17,7 @@ class cWasserstein_GAN(cDecoderGenerator, Wasserstein_GAN):
   def __init__(self, data_sampler, **kw):
     super().__init__(data_sampler, **kw)
 
+  #@tf.function
   def transform(self, gen_batch, **call_kw):
     return self.generator( gen_batch, **call_kw )
 
@@ -45,14 +46,14 @@ class cWasserstein_GAN(cDecoderGenerator, Wasserstein_GAN):
     """Only required when applying lipschitz smoothening"""
     return data[0]
 
-  @tf.function
+  #@tf.function
   def _compute_u_hat(self, x, x_hat):
     x_shape = tf.concat([x.shape[:1],tf.ones_like(x.shape[1:],dtype=tf.int32)],axis=0)
     epsilon = tf.random.uniform(x_shape, 0.0, 1.0)
     u_hat = epsilon * x + (1 - epsilon) * x_hat
     return u_hat
 
-  @tf.function
+  #@tf.function
   def _lipschitz_penalty(self, x, x_hat, lipschitz_conditioning):
     u_hat = self._compute_u_hat(x, x_hat)
     with tf.GradientTape() as penalty_tape:
@@ -67,52 +68,53 @@ class cWasserstein_GAN(cDecoderGenerator, Wasserstein_GAN):
     lipschitz = tf.multiply(self._grad_weight, lipschitz)
     return lipschitz
 
-  @tf.function
-  def _get_critic_loss( self, real_output, fake_output, lipschitz ):
-    critic_loss = tf.add( self.wasserstein_loss(real_output, fake_output), lipschitz )
-    return critic_loss
+  #@tf.function
+  def _surrogate_loss( self, data_output, gen_output, critic_lipschitz ):
+    wasserstein_loss, critic_data, critic_generator = self.wasserstein_loss(data_output, gen_output)
+    critic_total = tf.add( wasserstein_loss, critic_lipschitz )
+    return { "critic_total":     critic_total
+           , "lipschitz":        critic_lipschitz
+           , "critic_data":      critic_data
+           , "critic_gen":       critic_generator
+           , "wasserstein":      wasserstein_loss }
 
-  @tf.function
-  def _split_lipschitz( self, real_batch, fake_batch ):
-    real_idxs = tf.random.shuffle( tf.range(start = 0, limit = tf.constant(self.data_sampler._batch_size)) )[:self.data_sampler._batch_size//2]
-    fake_idxs = tf.random.shuffle( tf.range(start = 0, limit = tf.constant(self.data_sampler._batch_size)) )[:self.data_sampler._batch_size//2]
-    lipschitz_conditioning = [tf.concat([tf.gather(x,real_idxs)
-                                        ,tf.gather(y,fake_idxs)], axis = 0)
-                              for x, y in zip(self.extract_critic_conditioning(real_batch)
-                                             ,self.extract_critic_conditioning(fake_batch))]
-    real_inputs = tf.concat([tf.gather(self.extract_critic_input(real_batch), real_idxs)
-                            ,tf.gather(self.extract_critic_input(fake_batch), fake_idxs)], axis = 0)
-    sampled_input = tf.gather( self.extract_generator_input_from_standard_batch_fcn(real_batch), real_idxs) 
+  #@tf.function
+  def _split_lipschitz( self, data_batch, gen_batch ):
+    data_idxs = tf.random.shuffle( tf.range(start = 0, limit = tf.constant(self.data_sampler._batch_size)) )[:self.data_sampler._batch_size//2]
+    gen_idxs = tf.random.shuffle( tf.range(start = 0, limit = tf.constant(self.data_sampler._batch_size)) )[:self.data_sampler._batch_size//2]
+    lipschitz_conditioning = [tf.concat([tf.gather(x,data_idxs)
+                                        ,tf.gather(y,gen_idxs)], axis = 0)
+                              for x, y in zip(self.extract_critic_conditioning(data_batch)
+                                             ,self.extract_critic_conditioning(gen_batch))]
+    data_inputs = tf.concat([tf.gather(self.extract_critic_input(data_batch), data_idxs)
+                            ,tf.gather(self.extract_critic_input(gen_batch), gen_idxs)], axis = 0)
+    sampled_input = tf.gather( self.extract_generator_input_from_standard_batch_fcn(data_batch), data_idxs) 
     if not isinstance(sampled_input, list):
       sampled_input = [sampled_input]
-    generator_inpput = sampled_input + [self.sample_latent_data( self.data_sampler._batch_size//2 ) ]
-    fake_inputs = tf.concat([self.transform( generator_input, **self._training_kw )
-                            ,tf.gather(self.extract_critic_input(fake_batch), fake_idxs)], axis = 0)
-    return real_inputs, fake_inputs, lipschitz_conditioning
+    generator_inpput = sampled_input + [self.sample_latent( self.data_sampler._batch_size//2 ) ]
+    gen_inputs = tf.concat([self.transform( generator_input, **self._training_kw )
+                            ,tf.gather(self.extract_critic_input(gen_batch), gen_idxs)], axis = 0)
+    return data_inputs, gen_inputs, lipschitz_conditioning
 
-  @tf.function
-  def _train_step(self, real_batch, gen_batch, critic_only = False):
+  #@tf.function
+  def _train_step(self, data_batch, gen_batch, critic_only = False):
     with tf.GradientTape() as gen_tape, tf.GradientTape() as critic_tape:
-      fake_batch = self.transform(gen_batch, **self._training_kw )
-      real_output, fake_output = self._get_critic_output( real_batch, fake_batch )
+      gen_batch  = self.transform(gen_batch, **self._training_kw)
+      data_output = self.critic(data_batch, **self._training_kw)
+      gen_output = self.critic(gen_batch, **self._training_kw)
       if self._use_lipschitz_penalty: 
         if not(self.use_same_real_fake_conditioning):
-          real_inputs, fake_inputs, lipschitz_conditioning = self._split_lipschitz( real_batch, fake_batch )
+          data_inputs, gen_inputs, lipschitz_conditioning = self._split_lipschitz( data_batch, gen_batch )
         else:
-          real_inputs            = self.extract_critic_input(real_batch)
-          fake_inputs            = self.extract_critic_input(fake_batch)
-          lipschitz_conditioning = self.extract_critic_conditioning(real_batch)
-        lipschitz = self._lipschitz_penalty(real_inputs, fake_inputs, lipschitz_conditioning)
+          data_inputs            = self.extract_critic_input(data_batch)
+          gen_inputs             = self.extract_critic_input(gen_batch)
+          lipschitz_conditioning = self.extract_critic_conditioning(data_batch)
+        lipschitz = self._lipschitz_penalty(data_inputs, gen_inputs, lipschitz_conditioning)
       else:
         lipschitz = tf.constant(0.)
-      critic_loss = self._get_critic_loss( real_output, fake_output, lipschitz )
-      if not critic_only:
-        gen_loss = self._get_gen_loss( fake_batch, fake_output )
+      critic_loss_dict = self._surrogate_loss( data_output, gen_output, lipschitz )
     # gen_tape, critic_tape
-    self._apply_critic_update( critic_tape, critic_loss )
-    ret_dict = { 'critic' :    critic_loss
-               , 'lipschitz' : lipschitz }
+    self._apply_critic_update( critic_tape, critic_loss_dict["critic_total"] )
     if not critic_only:
-      self._apply_gen_update( gen_tape, gen_loss )
-      ret_dict['generator'] = gen_loss
-    return ret_dict
+      self._apply_gen_update( gen_tape, critic_loss_dict["critic_gen"] )
+    return critic_loss_dict

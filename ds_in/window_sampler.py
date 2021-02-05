@@ -72,6 +72,8 @@ class WindowSampler(SamplerBase):
       self._past_window_size = cycle_width - cycle_shift
       self._past_widths_up_to_mark_zero = []
     else:
+      if self._overlaps is None:
+        self._overlaps = [0]*len(past_widths)
       if self._past_widths_wrt_present:
         self._past_window_size = max(past_widths)
         self._past_widths = np.array(past_widths) - np.array([0] + past_widths[:-1])
@@ -101,7 +103,7 @@ class WindowSampler(SamplerBase):
     _CacheStorage.clear_cached_functions()
     # Compute windows
     self.n_cycles = n_cycles
-    self.present_mark_step = self._past_window_size+1 if self._past_widths is not None else 0
+    self.present_mark_step = self._past_window_size if self._past_widths is not None else 0
     self.future_window_size = n_cycles*self._cycle_shift
     self.total_window_size  = self._past_window_size + self.future_window_size
 
@@ -137,8 +139,8 @@ class WindowSampler(SamplerBase):
       if not self._sample_from_marginals:
         plot_col = self._features[0]
     if not self._sample_from_marginals:
-      feature_plot_col_index = self._feature_column_map.get(plot_col,None)
-      #label_plot_col_index = self.label_column_map.get(plot_col,None)
+      plot_col = self._feature_column_map.get(plot_col,None)
+      feature_plot_col_index = slice(plot_col, plot_col+1) if plot_col is not None else slice(None)
     else:
       feature_plot_col_index = slice(None)
     colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
@@ -159,7 +161,7 @@ class WindowSampler(SamplerBase):
       if feature_plot_col_index is not None or self._sample_from_marginals:
         slices = [d[:,:,feature_plot_col_index] for d in inputs["slices"]] if isinstance(inputs, dict) else []
         for i, (idxs, s, input_opts) in enumerate(zip(self.all_past_indices, slices, input_cycler)):
-          plt.plot(delta[idxs], np.squeeze(self._pp.inverse_transform(s)[0,:,:])
+          plt.plot(delta[idxs], np.squeeze(s[0,:,:])#self._pp.inverse_transform(s)[0,:,:])
               , label='Past period [%d]' % i, markersize=2
               , markeredgewidth=1, **input_opts, alpha = 0.7)
       # Plot cycles
@@ -167,7 +169,7 @@ class WindowSampler(SamplerBase):
         cycle = inputs["cycle"][c,:,feature_plot_col_index] if isinstance(inputs, dict) else inputs
         if plot_col: plt.ylabel(f'{plot_col}')
         if feature_plot_col_index is not None or self._sample_from_marginals:
-          plt.plot(delta[self._cycle_indices(c)], np.squeeze(self._pp.inverse_transform(cycle))
+          plt.plot(delta[self._cycle_indices(c)], np.squeeze(cycle)#self._pp.inverse_transform(cycle))
               , label=(('Cycle [%d]' % c) if c in (0,self.n_cycles-1) else '') if self.n_cycles>1 else 'Input', markersize=2
               , markeredgewidth=1, alpha = 0.7
               , **cycle_opts)
@@ -363,11 +365,13 @@ class WindowSampler(SamplerBase):
 
     val_slice                     = slice(int(n_tr*train_frac),None)
     self.val_df                   = full_train_df[val_slice]
-    self.val_df.reset_index(drop  = True,inplace=True)
+    if hasattr(self.val_df, "reset_index"):
+      self.val_df.reset_index(drop = True,inplace=True)
 
     test_slice                    = slice(int(n*full_train_frac)+1,None)
     self.test_df                  = df[test_slice]
-    self.test_df.reset_index(drop = True,inplace=True)
+    if hasattr(self.test_df, "reset_index"):
+      self.test_df.reset_index(drop = True,inplace=True)
     return
 
   def __repr__(self):

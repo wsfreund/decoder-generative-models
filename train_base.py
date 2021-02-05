@@ -545,6 +545,7 @@ class TrainBase(MaskModel):
     for model_key, model in self._model_dict.items():
       if not hasattr(self,model_key):
         model.compile()
+        if self._verbose: print("%s has %d parameters" % (model_key, model.count_params()))
         setattr(self,model_key,model)
       else:
         raise RuntimeError("Duplicated model %s." % model_key )
@@ -565,6 +566,8 @@ class TrainBase(MaskModel):
     from IPython.display import display
     if not hasattr(self,"_surrogate_fig"):
       self._surrogate_fig, self._surrogate_ax = plt.subplots()
+    else:
+      self._surrogate_ax.cla()
     steps = np.array(surrogate_loss_record['step'])
     for k, v in surrogate_loss_record.items():
       if k == "step":
@@ -598,6 +601,8 @@ class TrainBase(MaskModel):
       self._perf_final_ax.set_ylabel("Performance/Loss")
       if n_keys == 1:
         self._all_perf_ax = [self._all_perf_ax]
+    else:
+      for ax in self._all_perf_ax: ax.cla()
     steps = np.array(val_perf_record['step'])
     def add_plot(ax, steps, record, key, label):
       v = np.array(record[key])

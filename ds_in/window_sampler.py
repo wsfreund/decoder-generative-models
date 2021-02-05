@@ -225,10 +225,18 @@ class WindowSampler(SamplerBase):
         sequence_stride=self._sequence_stride,
         shuffle=False,
         batch_size=tf.constant(1,dtype=tf.int64),)
+    if cache_filepath: cache_filepath += '_win%d' % self.total_window_size
+    if cache_filepath: cache_filepath += '_stride%d' % self._sequence_stride
     # XXX Hack to remove batching
     ds = ds._input_dataset
     # Cache just after the heavy windowing operation so that it is shared
     # across each subset, independently of the next configs
+    if self._sample_from_marginals:
+      if cache_filepath: cache_filepath += '_marginals'
+      ds = self._pattern_sampler(ds)
+    if bool(opts.take_n):
+      if cache_filepath: cache_filepath += '_take%d' % opts.take_n
+      ds = ds.take( opts.take_n )
     if cache_filepath:
       if cache_filepath not in self._cached_filepath_dict:
         mkdir_p(cache_filepath)
@@ -237,12 +245,8 @@ class WindowSampler(SamplerBase):
       else:
         ds = ds.cache()
         print("Warning: Caching on memory although specified to cache on disk.\nReason: Dataset at '%s' is already currently being cached." % cache_filepath )
-    if self._sample_from_marginals:
-      ds = self._pattern_sampler(ds)
     if bool(opts.shuffle):
       ds = ds.shuffle(**opts.shuffle_kwargs)
-    if bool(opts.take_n):
-      ds = ds.take( opts.take_n )
     # Split windows into cycles
     ds = self._nested_timeseries(
         start_index = 0,

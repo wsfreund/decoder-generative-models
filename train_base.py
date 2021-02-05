@@ -75,7 +75,7 @@ class TrainBase(MaskModel):
     self._load_model_at_path       = retrieve_kw(kw, 'load_model_at_path',   None                                                       )
     # Whether to show online train plot
     self._online_train_plot        = retrieve_kw(kw, 'online_train_plot',    False                                                      )
-    # Additional collection of functions to plot during training. Receive the training instance as argument
+    # Additional collection of functions to plot during training.
     self._online_plot_fcns         = retrieve_kw(kw, 'online_plot_fcns',     []                                                         )
     # Interval for logging using updates
     self._print_interval_steps     = retrieve_kw(kw, 'print_interval_steps', 1000                                                       )
@@ -85,14 +85,6 @@ class TrainBase(MaskModel):
     self._print_interval_epoches   = retrieve_kw(kw, 'print_interval_epoches', 5                                                        )
     # Path to log tensorboard data
     self._tensorboard_log_path     = retrieve_kw(kw, 'tensorboard_log_path', 'tensorboard_logs'                                         )
-    tensorboard_key = os.path.expandvars("$TENSORBOARD_LOGGING_KEY")
-    user = os.path.expandvars("$USER")
-    if tensorboard_key != "$TENSORBOARD_LOGGING_KEY":
-      self._tensorboard_log_path += "_" + tensorboard_key
-    elif user != "$USER":
-      self._tensorboard_log_path += "_" + user
-    else:
-      pass
     # String specifying model label
     self._model_name               = retrieve_kw(kw, 'model_name', self.__class__.__name__                                              )
     # String specifying model first initialization time
@@ -115,8 +107,23 @@ class TrainBase(MaskModel):
     self._use_grad_clipping        = tf.constant( retrieve_kw(kw, 'use_grad_clipping', False  ) )
     # Gradient clipping function
     self._grad_clipping_fcn        = retrieve_kw(kw, 'grad_clipping_fcn', lambda x: tf.clip_by_norm( x, 2.0 )  )
+    # Surrogate plot options
+    self._surrogate_plot_xscale    = retrieve_kw(kw, 'surrogate_plot_xscale',  None                                                )
+    self._surrogate_plot_yscale    = retrieve_kw(kw, 'surrogate_plot_yscale',  'linear'                                            )
+    # Surrogate plot options
+    self._perf_plot_xscale         = retrieve_kw(kw, 'perf_plot_xscale',  None                                                     )
+    self._perf_plot_yscale         = retrieve_kw(kw, 'perf_plot_yscale',  {}                                                       )
     # Maximum number of samples to use when evaluating performance
     ## Setup
+    if self._tensorboard_log_path:
+      tensorboard_key = os.path.expandvars("$TENSORBOARD_LOGGING_KEY")
+      user = os.path.expandvars("$USER")
+      if tensorboard_key != "$TENSORBOARD_LOGGING_KEY":
+        self._tensorboard_log_path += "_" + tensorboard_key
+      elif user != "$USER":
+        self._tensorboard_log_path += "_" + user
+      else:
+        pass
     # lkeys and val_lkeys are used to select which losses are to be recorded
     self._surrogate_lkeys  = {"step",}
     self._train_perf_lkeys = {"step",} | set(map(lambda m: m.name, self._train_perf_meters))
@@ -147,6 +154,10 @@ class TrainBase(MaskModel):
       assert isinstance(meter,EffMeterBase)
     for meter in self._val_perf_meters:
       assert isinstance(meter,EffMeterBase)
+    assert self._surrogate_plot_xscale in ("log","linear", "mix", None, NotSet)
+    assert self._surrogate_plot_yscale in ("log","linear")
+    assert self._perf_plot_xscale in ("log","linear", "mix", None, NotSet)
+    assert all([v in ("log","linear") for v in self._perf_plot_yscale.values()])
 
   def train(self, fine_tuning = False):
     self._check_required_models()
@@ -554,8 +565,6 @@ class TrainBase(MaskModel):
     from IPython.display import display
     if not hasattr(self,"_surrogate_fig"):
       self._surrogate_fig, self._surrogate_ax = plt.subplots()
-    else:
-      self._surrogate_ax.cla()
     steps = np.array(surrogate_loss_record['step'])
     for k, v in surrogate_loss_record.items():
       if k == "step":
@@ -567,6 +576,8 @@ class TrainBase(MaskModel):
     self._surrogate_ax.set_xlabel("#Parameter Updates")
     self._surrogate_ax.set_ylabel("Surrogate Loss")
     self._surrogate_ax.legend()
+    self._surrogate_ax.set_xscale(self._retrieve_xscale(self._surrogate_plot_xscale, steps[-1]))
+    self._surrogate_ax.set_yscale(self._surrogate_plot_yscale)
     display(self._surrogate_fig)
 
   def _plot_performance_progress(self, train_perf_record, val_perf_record):
@@ -587,8 +598,6 @@ class TrainBase(MaskModel):
       self._perf_final_ax.set_ylabel("Performance/Loss")
       if n_keys == 1:
         self._all_perf_ax = [self._all_perf_ax]
-    else:
-      for ax in self._all_perf_ax: ax.cla()
     steps = np.array(val_perf_record['step'])
     def add_plot(ax, steps, record, key, label):
       v = np.array(record[key])
@@ -612,8 +621,16 @@ class TrainBase(MaskModel):
         ax.autoscale(enable=True, axis='x', tight=True)
         ax.tick_params(axis='both', which='major', labelsize=8)
         ax.tick_params(axis='both', which='minor', labelsize=6)
+        ax.set_xscale(self._retrieve_xscale(self._perf_plot_xscale, steps[-1]))
+        yscale = self._perf_plot_yscale.get(k,'linear')
+        ax.set_yscale(yscale)
       plt.tight_layout()
       display(self._perf_fig)
+
+  def _retrieve_xscale(self,val,step):
+    if val in (None,NotSet,"mix"):
+      return 'linear' if step < int(10e3) else 'log'
+    return val
 
   def _handle_new_loss_step(self, loss_record, loss_dict, keys = None, write_to_summary = False):
     if keys is None:
@@ -718,8 +735,8 @@ class TrainBase(MaskModel):
         print( ( '...Best Val: %.3f (step=%d) =>'  % 
             ( last_improvement['best_val_reco']
             , last_improvement['best_step'] ) )
-            + ( ( ' Fails = [%d/%d]' % ( 
-                "(<min prog)" if ( last_improvement['best_step'] != last_improvement['last_progress_step']) else ""
+            + ( ( ' Fails %s= [%d/%d]' % ( 
+                "(<min prog) " if ( last_improvement['best_step'] != last_improvement['last_progress_step']) else ""
               , delta_fail
               , self._max_fail
               ) ) 

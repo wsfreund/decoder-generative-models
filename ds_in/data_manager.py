@@ -64,13 +64,7 @@ class TimeseriesMetadata(object):
 
 class DataManager(object):
 
-  _basepaths = [
-      "/content/drive/My Drive/Notebooks/origin/datasets", # colab
-      "/content/drive/My Drive/Notebooks/psr_renewable_mybase/datasets", # colab
-      os.path.expandvars("$HOME/Notebooks/origin/renewable_gan/datasets/"),
-      os.path.expandvars("$HOME/Google Drive File Stream/Mon Drive/Notebooks/psr_renewable_mybase/datasets"),
-      os.path.expandvars("$HOME/Google Drive File Stream/Mon Drive/Notebooks/psr_renewable/datasets"),
-      ]
+  _basepaths = []
 
   def __init__( self, basefile, shuffle_on_first_read = False ):
     self._basefile = basefile

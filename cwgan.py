@@ -17,7 +17,7 @@ class cWasserstein_GAN(cDecoderGenerator, Wasserstein_GAN):
   def __init__(self, data_sampler, **kw):
     super().__init__(data_sampler, **kw)
 
-  #@tf.function
+  @tf.function
   def transform(self, gen_batch, **call_kw):
     return self.generator( gen_batch, **call_kw )
 
@@ -46,14 +46,14 @@ class cWasserstein_GAN(cDecoderGenerator, Wasserstein_GAN):
     """Only required when applying lipschitz smoothening"""
     return data[0]
 
-  #@tf.function
+  @tf.function
   def _compute_u_hat(self, x, x_hat):
     x_shape = tf.concat([x.shape[:1],tf.ones_like(x.shape[1:],dtype=tf.int32)],axis=0)
     epsilon = tf.random.uniform(x_shape, 0.0, 1.0)
     u_hat = epsilon * x + (1 - epsilon) * x_hat
     return u_hat
 
-  #@tf.function
+  @tf.function
   def _lipschitz_penalty(self, x, x_hat, lipschitz_conditioning):
     u_hat = self._compute_u_hat(x, x_hat)
     with tf.GradientTape() as penalty_tape:
@@ -61,14 +61,14 @@ class cWasserstein_GAN(cDecoderGenerator, Wasserstein_GAN):
       if not isinstance(lipschitz_conditioning, list):
         lipschitz_conditioning = [lipschitz_conditioning]
       critic_input = lipschitz_conditioning + [u_hat]
-      func = self.critic(critic_input)
+      func = self.critic(critic_input, **self._training_kw)
     grads = penalty_tape.gradient(func, u_hat)
     norm_grads = tf.sqrt(tf.reduce_sum(tf.square(grads), axis=tf.range(1,tf.size(tf.shape(x)))))
     lipschitz = tf.math.square( tf.reduce_mean((norm_grads - 1)))
     lipschitz = tf.multiply(self._grad_weight, lipschitz)
     return lipschitz
 
-  #@tf.function
+  @tf.function
   def _surrogate_loss( self, data_output, gen_output, critic_lipschitz ):
     wasserstein_loss, critic_data, critic_generator = self.wasserstein_loss(data_output, gen_output)
     critic_total = tf.add( wasserstein_loss, critic_lipschitz )
@@ -78,7 +78,7 @@ class cWasserstein_GAN(cDecoderGenerator, Wasserstein_GAN):
            , "critic_gen":       critic_generator
            , "wasserstein":      wasserstein_loss }
 
-  #@tf.function
+  @tf.function
   def _split_lipschitz( self, data_batch, gen_batch ):
     data_idxs = tf.random.shuffle( tf.range(start = 0, limit = tf.constant(self.data_sampler._batch_size)) )[:self.data_sampler._batch_size//2]
     gen_idxs = tf.random.shuffle( tf.range(start = 0, limit = tf.constant(self.data_sampler._batch_size)) )[:self.data_sampler._batch_size//2]
@@ -96,7 +96,7 @@ class cWasserstein_GAN(cDecoderGenerator, Wasserstein_GAN):
                             ,tf.gather(self.extract_critic_input(gen_batch), gen_idxs)], axis = 0)
     return data_inputs, gen_inputs, lipschitz_conditioning
 
-  #@tf.function
+  @tf.function
   def _train_step(self, data_batch, gen_batch, critic_only = False):
     with tf.GradientTape() as gen_tape, tf.GradientTape() as critic_tape:
       gen_batch  = self.transform(gen_batch, **self._training_kw)

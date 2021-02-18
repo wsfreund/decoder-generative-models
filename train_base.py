@@ -208,6 +208,8 @@ class TrainBase(MaskModel):
     val_perf_dict = {}
     first_step = True
     total_performance_measure_time = datetime.timedelta()
+    last_performance_measure_time = datetime.timedelta()
+    first_step_measure_time = datetime.timedelta()
     n_measurements = 0
 
     try:
@@ -545,7 +547,9 @@ class TrainBase(MaskModel):
     for model_key, model in self._model_dict.items():
       if not hasattr(self,model_key):
         model.compile()
-        if self._verbose: print("%s has %d parameters" % (model_key, model.count_params()))
+        import tensorflow.keras.backend as K
+        trainable_count = sum([K.count_params(w) for w in model.trainable_weights])
+        if self._verbose: print("%s has %d parameters (%d trainable)" % (model_key, model.count_params(), trainable_count))
         setattr(self,model_key,model)
       else:
         raise RuntimeError("Duplicated model %s." % model_key )
@@ -709,9 +713,11 @@ class TrainBase(MaskModel):
       '; '.join([("%s: %.3f" % (k, v)) for k, v in surrogate_loss_dict.items() if k is not 'step']) + "."
     )
     if train_perf_dict or val_perf_dict:
-      lost_steps = step * ( total_performance_measure_time / ( train_time - total_performance_measure_time ) )
+      steps_per_second = ( step / ( train_time - total_performance_measure_time ).total_seconds() )
+      lost_steps = total_performance_measure_time.total_seconds() * steps_per_second
       lost_frac = ( step + lost_steps ) / step  - 1.
       print('::Performance @ step %i:' % train_perf_dict['step'] )
+      print('...Runtime speed: avg: %.2fit/s.' % steps_per_second )
       print('...Runtime overhead: last: %s; avg: %s (n=%d); total: %s (eff:%s%%|lost:%4.0f|incr:%s%%); first: %s.' % 
             ( last_performance_measure_time
             , ( total_performance_measure_time - first_step_measure_time ) / ( n_measurements - 1 ) if ( n_measurements - 1 ) > 0 else '---'

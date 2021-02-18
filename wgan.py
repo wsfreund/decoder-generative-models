@@ -61,7 +61,7 @@ class Wasserstein_GAN(DecoderGenerator):
     u_hat = self._compute_u_hat(x, x_hat)
     with tf.GradientTape() as penalty_tape:
       penalty_tape.watch(u_hat)
-      func = self.critic(u_hat)
+      func = self.critic(u_hat, **self._training_kw)
     grads = penalty_tape.gradient(func, u_hat)
     norm_grads = tf.sqrt(tf.reduce_sum(tf.square(grads), axis=[1, 2]))
     regularizer = tf.math.square( tf.reduce_mean((norm_grads - 1) ) )

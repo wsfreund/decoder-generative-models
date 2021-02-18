@@ -240,7 +240,6 @@ class RandomCrossShuffleWithCorrelatedNoise(RandomCrossShuffle):
 # - Add noise to FFT -> remove/change a fraction of frequencies (group in high/medium/low?)
 #   - Note: This one is a bit more difficult because it requires long samples and subsampling within this longer sample
 # - Apply moving averages and other smoothing methods/filters 
-# - Mix farms with different data (i.e. use different farms as other) 
 # - Other can be a function plus noise:
 #   - Function can be a polynomial;
 #   - Periodic

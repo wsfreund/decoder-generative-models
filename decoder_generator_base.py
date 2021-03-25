@@ -56,13 +56,6 @@ class DecoderGenerator(TrainBase):
     if not gen_meters and not critic_meters:
       return final_loss_dict
 
-    for meter in gen_meters:
-      meter.reset()
-      meter.initialize()
-    for meter in critic_meters:
-      meter.reset()
-      meter.initialize()
-
     def lrun( ldata, lgen, lmeters ):
       # Accumulate gens
       for meter in lmeters:

@@ -32,14 +32,12 @@ def ResNet(stack_fn, seq_input, preact, use_bias, model_name='resnet'):
   if kwargs:
     raise ValueError('Unknown argument(s): %s' % (kwargs,))
 
-  bn_axis = 2 if backend.image_data_format() == 'channels_last' else 1
-
   # This is the top
   #x = layers.ZeroPadding1D(padding=((3,), (3,)), name='conv1_pad')(seq_input)
   #x = layers.Conv1D(64, 7, strides=2, use_bias=use_bias, name='conv1_conv')(x)
 
   #if not preact:
-  #  x = layers.BatchNormalization( axis=bn_axis, epsilon=1.001e-5, name='conv1_bn')(x)
+  #  x = layers.BatchNormalization( epsilon=1.001e-5, name='conv1_bn')(x)
   #  x = layers.Activation('relu', name='conv1_relu')(x)
 
   #x = layers.ZeroPadding1D(padding=((1,), (1,)), name='pool1_pad')(x)
@@ -49,7 +47,7 @@ def ResNet(stack_fn, seq_input, preact, use_bias, model_name='resnet'):
 
   if preact:
     x = layers.BatchNormalization(
-        axis=bn_axis, epsilon=1.001e-5, name='post_bn')(x)
+        epsilon=1.001e-5, name='post_bn')(x)
     x = layers.Activation('relu', name='post_relu')(x)
 
   ## Ensure that the model takes into account
@@ -67,7 +65,13 @@ def ResNet(stack_fn, seq_input, preact, use_bias, model_name='resnet'):
   return x
 
 
-def block1(x, filters, kernel_size=3, stride=1, kernel_initializer='glorot_uniform', layer_kwargs={}, bottleneck=True, conv_shortcut=True, name=None):
+def block1( x, filters, kernel_size=3, stride=1
+          , kernel_initializer='glorot_uniform', layer_kwargs={}
+          , bottleneck=True, conv_shortcut=True
+          , normalization = layers.BatchNormalization
+          , shortcut_normalization = layers.BatchNormalization
+          , wrapper = lambda x: x
+          , name=None):
   """A residual block.
   Arguments:
     x: input tensor.
@@ -81,35 +85,38 @@ def block1(x, filters, kernel_size=3, stride=1, kernel_initializer='glorot_unifo
   Returns:
     Output tensor for the residual block.
   """
-  bn_axis = 2 if backend.image_data_format() == 'channels_last' else 1
-
   if conv_shortcut:
     if bottleneck:
-      shortcut = layers.Conv1D(4 * filters, 1, strides=stride, kernel_initializer=kernel_initializer, name=name + '_0_conv', **layer_kwargs)(x)
+      shortcut = wrapper(layers.Conv1D(4 * filters, 1, strides=stride, kernel_initializer=kernel_initializer, name=name + '_0_conv', **layer_kwargs))(x)
     else:
-      shortcut = layers.Conv1D(filters, 1, strides=stride, kernel_initializer=kernel_initializer, name=name + '_0_conv', **layer_kwargs)(x)
-    shortcut = layers.BatchNormalization(axis=bn_axis, epsilon=1.001e-5, name=name + '_0_bn')(shortcut)
+      shortcut = wrapper(layers.Conv1D(filters, 1, strides=stride, kernel_initializer=kernel_initializer, name=name + '_0_conv', **layer_kwargs))(x)
+    if shortcut_normalization is not None: shortcut = shortcut_normalization(epsilon=1.001e-5, name=name + '_0_bn')(shortcut)
   else:
     shortcut = x
 
-  x = layers.Conv1D(filters, 1, strides=stride, kernel_initializer=kernel_initializer, name=name + '_1_conv', **layer_kwargs)(x)
-  x = layers.BatchNormalization( axis=bn_axis, epsilon=1.001e-5, name=name + '_1_bn')(x)
+  x = wrapper(layers.Conv1D(filters, 1, strides=stride, kernel_initializer=kernel_initializer, name=name + '_1_conv', **layer_kwargs))(x)
+  if normalization is not None: x = normalization( epsilon=1.001e-5, name=name + '_1_bn')(x)
   x = layers.Activation('relu', name=name + '_1_relu')(x)
 
-  x = layers.Conv1D( filters, kernel_size, padding='SAME', kernel_initializer=kernel_initializer, name=name + '_2_conv', **layer_kwargs)(x)
-  x = layers.BatchNormalization( axis=bn_axis, epsilon=1.001e-5, name=name + '_2_bn', gamma_initializer='zeros' if not bottleneck else 'ones' )(x)
+  x = wrapper(layers.Conv1D( filters, kernel_size, padding='SAME', kernel_initializer=kernel_initializer, name=name + '_2_conv', **layer_kwargs))(x)
+  if normalization is not None: x = normalization( epsilon=1.001e-5, name=name + '_2_bn', gamma_initializer='zeros' if not bottleneck else 'ones' )(x)
 
   if bottleneck:
     x = layers.Activation('relu', name=name + '_2_relu')(x)
-    x = layers.Conv1D(4 * filters, 1, kernel_initializer=kernel_initializer, name=name + '_3_conv', **layer_kwargs)(x)
-    x = layers.BatchNormalization(axis=bn_axis, epsilon=1.001e-5, name=name + '_3_bn', gamma_initializer='zeros')(x)
+    x = wrapper(layers.Conv1D(4 * filters, 1, kernel_initializer=kernel_initializer, name=name + '_3_conv', **layer_kwargs))(x)
+    if normalization is not None: x = normalization(epsilon=1.001e-5, name=name + '_3_bn', gamma_initializer='zeros')(x)
 
   x = layers.Add(name=name + '_add')([shortcut, x])
   x = layers.Activation('relu', name=name + '_out')(x)
   return x
 
 
-def stack1(x, filters, blocks, kernel_size=3, stride1=2, kernel_initializer='glorot_uniform', layer_kwargs={}, name=None):
+def stack1( x, filters, blocks, kernel_size=3, stride1=2
+          , kernel_initializer='glorot_uniform', layer_kwargs={}
+          , normalization = layers.BatchNormalization
+          , shortcut_normalization = layers.BatchNormalization
+          , wrapper = lambda x: x
+          , name=None):
   """A set of stacked residual blocks.
 
   Arguments:
@@ -122,13 +129,27 @@ def stack1(x, filters, blocks, kernel_size=3, stride1=2, kernel_initializer='glo
   Returns:
     Output tensor for the stacked blocks.
   """
-  x = block1(x, filters, kernel_size=kernel_size, stride=stride1, kernel_initializer=kernel_initializer, name=name + '_block1', layer_kwargs=layer_kwargs)
+  x = block1( x, filters, kernel_size=kernel_size, stride=stride1
+            , kernel_initializer=kernel_initializer, name=name + '_block1'
+            , layer_kwargs=layer_kwargs
+            , normalization = normalization
+            , shortcut_normalization = shortcut_normalization
+            , wrapper = wrapper )
   for i in range(2, blocks + 1):
-    x = block1(x, filters, kernel_size=kernel_size, conv_shortcut=False, kernel_initializer=kernel_initializer, name=name + '_block' + str(i), layer_kwargs=layer_kwargs)
+    x = block1( x, filters, kernel_size=kernel_size, conv_shortcut=False
+              , kernel_initializer=kernel_initializer, name=name + '_block' + str(i)
+              , layer_kwargs=layer_kwargs
+              , normalization = normalization
+              , shortcut_normalization = shortcut_normalization
+              , wrapper = wrapper )
   return x
 
 
-def block2(x, filters, kernel_size=3, stride=1, conv_shortcut=False, name=None):
+def block2(x, filters, kernel_size=3, stride=1
+          , kernel_initializer='glorot_uniform', layer_kwargs={}
+          , normalization = layers.BatchNormalization
+          , wrapper = lambda x: x
+          , conv_shortcut=False, name=None):
   """A residual block.
 
   Arguments:
@@ -143,34 +164,38 @@ def block2(x, filters, kernel_size=3, stride=1, conv_shortcut=False, name=None):
   Returns:
     Output tensor for the residual block.
   """
-  bn_axis = 2 if backend.image_data_format() == 'channels_last' else 1
-
-  preact = layers.BatchNormalization(
-      axis=bn_axis, epsilon=1.001e-5, name=name + '_preact_bn')(x)
+  if normalization is not None: preact = normalization( epsilon=1.001e-5, name=name + '_preact_bn')(x)
   preact = layers.Activation('relu', name=name + '_preact_relu')(preact)
 
   if conv_shortcut:
-    shortcut = layers.Conv1D(
-        4 * filters, 1, strides=stride, name=name + '_0_conv')(preact)
+    shortcut = wrapper(layers.Conv1D(4 * filters, 1, strides=stride
+                                    , kernel_initializer=kernel_initializer
+                                    , name=name + '_0_conv', **layer_kwargs))(preact)
   else:
     shortcut = layers.MaxPooling1D(1, strides=stride)(x) if stride > 1 else x
 
-  x = layers.Conv1D(
-      filters, 1, strides=1, use_bias=False, name=name + '_1_conv')(preact)
-  x = layers.BatchNormalization( axis=bn_axis, epsilon=1.001e-5, name=name + '_1_bn')(x)
+  x = wrapper( layers.Conv1D(filters, 1, strides=1, use_bias=False, name=name + '_1_conv'
+                            , kernel_initializer=kernel_initializer, **layer_kwargs) )(preact)
+  if normalization is not None: x = normalization( epsilon=1.001e-5, name=name + '_1_bn')(x)
   x = layers.Activation('relu', name=name + '_1_relu')(x)
 
   x = layers.ZeroPadding1D(padding=((1,), (1,)), name=name + '_2_pad')(x)
-  x = layers.Conv1D( filters, kernel_size, strides=stride, use_bias=False, name=name + '_2_conv')(x)
-  x = layers.BatchNormalization( axis=bn_axis, epsilon=1.001e-5, name=name + '_2_bn')(x)
+  x = wrapper( layers.Conv1D( filters, kernel_size, strides=stride, use_bias=False, name=name + '_2_conv'
+                            , kernel_initializer=kernel_initializer,**layer_kwargs) )(x)
+  if normalization is not None: x = normalization( epsilon=1.001e-5, name=name + '_2_bn')(x)
   x = layers.Activation('relu', name=name + '_2_relu')(x)
 
-  x = layers.Conv1D(4 * filters, 1, name=name + '_3_conv')(x)
+  x = wrapper( layers.Conv1D(4 * filters, 1, name=name + '_3_conv', kernel_initializer=kernel_initializer, **layer_kwargs) )(x)
   x = layers.Add(name=name + '_out')([shortcut, x])
   return x
 
 
-def stack2(x, filters, blocks, stride1=2, name=None):
+def stack2(x, filters, blocks, stride1=2
+          , kernel_initializer='glorot_uniform', layer_kwargs={}
+          , normalization = layers.BatchNormalization
+          , shortcut_normalization = layers.BatchNormalization
+          , wrapper = lambda x: x
+          , name=None):
   """A set of stacked residual blocks.
 
   Arguments:
@@ -183,10 +208,22 @@ def stack2(x, filters, blocks, stride1=2, name=None):
   Returns:
       Output tensor for the stacked blocks.
   """
-  x = block2(x, filters, conv_shortcut=True, name=name + '_block1')
+  x = block2(x, filters, conv_shortcut=True, name=name + '_block1'
+            , kernel_initializer=kernel_initializer
+            , layer_kwargs=layer_kwargs
+            , normalization = normalization
+            , wrapper = wrapper )
   for i in range(2, blocks):
-    x = block2(x, filters, name=name + '_block' + str(i))
-  x = block2(x, filters, stride=stride1, name=name + '_block' + str(blocks))
+    x = block2(x, filters, name=name + '_block' + str(i)
+              , kernel_initializer=kernel_initializer
+              , layer_kwargs=layer_kwargs
+              , normalization = normalization
+              , wrapper = wrapper )
+  x = block2(x, filters, stride=stride1, name=name + '_block' + str(blocks)
+            , kernel_initializer=kernel_initializer
+            , layer_kwargs=layer_kwargs
+            , normalization = normalization
+            , wrapper = wrapper )
   return x
 
 
@@ -206,16 +243,15 @@ def block3(x, filters, kernel_size=3, stride=1, groups=32, conv_shortcut=True, n
   Returns:
     Output tensor for the residual block.
   """
-  bn_axis = 2 if backend.image_data_format() == 'channels_last' else 1
 
   if conv_shortcut:
     shortcut = layers.Conv1D( (64 // groups) * filters, 1, strides=stride, use_bias=False, name=name + '_0_conv')(x)
-    shortcut = layers.BatchNormalization( axis=bn_axis, epsilon=1.001e-5, name=name + '_0_bn')(shortcut)
+    shortcut = layers.BatchNormalization( epsilon=1.001e-5, name=name + '_0_bn')(shortcut)
   else:
     shortcut = x
 
   x = layers.Conv1D(filters, 1, use_bias=False, name=name + '_1_conv')(x)
-  x = layers.BatchNormalization( axis=bn_axis, epsilon=1.001e-5, name=name + '_1_bn')(x)
+  x = layers.BatchNormalization( epsilon=1.001e-5, name=name + '_1_bn')(x)
   x = layers.Activation('relu', name=name + '_1_relu')(x)
 
   c = filters // groups
@@ -225,11 +261,11 @@ def block3(x, filters, kernel_size=3, stride=1, groups=32, conv_shortcut=True, n
   x = layers.Reshape(x_shape + (groups, c, c))(x)
   x = layers.Lambda( lambda x: sum(x[:, :, :, :, i] for i in range(c)), name=name + '_2_reduce')(x)
   x = layers.Reshape(x_shape + (filters,))(x)
-  x = layers.BatchNormalization( axis=bn_axis, epsilon=1.001e-5, name=name + '_2_bn')(x)
+  x = layers.BatchNormalization( epsilon=1.001e-5, name=name + '_2_bn')(x)
   x = layers.Activation('relu', name=name + '_2_relu')(x)
 
   x = layers.Conv1D( (64 // groups) * filters, 1, use_bias=False, name=name + '_3_conv')(x)
-  x = layers.BatchNormalization( axis=bn_axis, epsilon=1.001e-5, name=name + '_3_bn')(x)
+  x = layers.BatchNormalization( epsilon=1.001e-5, name=name + '_3_bn')(x)
 
   x = layers.Add(name=name + '_add')([shortcut, x])
   x = layers.Activation('relu', name=name + '_out')(x)

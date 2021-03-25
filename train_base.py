@@ -421,7 +421,8 @@ class TrainBase(MaskModel):
             print('Recovering Best Validation Performance @ (Epoch %i, Step %i).' % (lc.best_epoch, lc.best_step,))
             print('Reco_loss: %.3f.' % (lc.best_val_reco))
             self.load(  self._save_model_at_path, val = True )
-    self.save( overwrite = True, locals_data = lc )
+    self.save( save_models_and_optimizers = False
+             , overwrite = True, locals_data = lc )
     # Compute final performance:
     final_performance = {}
     if self._has_performance_measure_fcn:
@@ -485,20 +486,21 @@ class TrainBase(MaskModel):
   def _save_optimizer( self, key, optimizer ):
     np.savez( key, np.array(optimizer.get_weights(), dtype=np.object) )
 
-  def load(self, path, val = False, return_loss = False, return_locals = False ):
+  def load(self, path, val = False, load_optimizer = True, return_loss = False, return_locals = False ):
     if not self._model_io_keys:
       raise ValueError("Empty model io keys for class %s" % self.__class__.__name__)
     if not(return_locals or return_loss):
-      for ko, optimizer in self._optimizer_dict.items():
-        model = self._model_dict[ko]
-        try:
-          ko += '_opt'
-          if val: ko += '_bestval'
-          ko +=  '.npz'
-          if optimizer is not None:
-            self._load_optimizer(os.path.join(path,ko), optimizer, model)
-        except FileNotFoundError:
-          print("Warning: Could not recover %s optimizer state." % ko)
+      if load_optimizer:
+        for ko, optimizer in self._optimizer_dict.items():
+          model = self._model_dict[ko]
+          try:
+            ko += '_opt'
+            if val: ko += '_bestval'
+            ko +=  '.npz'
+            if optimizer is not None:
+              self._load_optimizer(os.path.join(path,ko), optimizer, model)
+          except FileNotFoundError:
+            print("Warning: Could not recover %s optimizer state." % ko)
       for k in self._model_io_keys:
         model = self._model_dict[k]
         if val: 

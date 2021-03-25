@@ -10,35 +10,44 @@ class ACF(ScalarEff,GenerativeEffMeter):
     self.start_lag = start_lag
     self.stop_lag = stop_lag
 
-  def initialize(self, x_data, x_gen = None, xmask_g1 = None, xmask_g2 = None):
+  def initialize(self, x_data_list, x_gen = None, xmask_g1 = None, xmask_g2 = None):
     if self.initialized:
       return
     if xmask_g1 is not None or xmask_g2 is not None:
       raise NotImplementedError("ePDF is not currently implemented for masked data")
+    if not isinstance(x_data_list, list):
+      x_data_list = [x_data_list]
+      
     self.reset()
-    self.acf_data = acf_tf(x_data, start_lag = self.start_lag, stop_lag = self.stop_lag)
     self.initialized = True
+    
+    xdata = tf.concat([x for x in x_data_list], axis = 0)
+    self.acf_data = acf_tf(xdata, start_lag = self.start_lag, stop_lag = self.stop_lag)
 
-  def accumulate(self, xgen, xmask = None ):
+  def accumulate(self, xgen_list, xmask = None ):
     if xmask is not None:
       raise NotImplementedError("ACF is not currently implemented for masked data")
-    if self.i > 0:
-      raise NotImplementedError("ACF is not able to work with multiple minibatches")
+    if not isinstance(xgen_list, list):
+      xgen_list = [xgen_list]
+
     self.start
-    self.acf_gen        = acf_tf(xgen, start_lag = self.start_lag, stop_lag = self.stop_lag)
-    self.acf_per_feature = self._compute_stats( self.acf_gen )
-    self.total_acf       = tf.math.reduce_mean( self._compute_stats( self.acf_gen ) )
+    
+    xgen = tf.concat([x for x in xgen_list], axis = 0)
+    self.acf_gen = acf_tf(xgen, start_lag = self.start_lag, stop_lag = self.stop_lag)
     self.i += 1
+    
     self.stop
-    return self.total_acf
+    return self.acf_gen
 
   @tf.function
-  def _compute_stats(self, acf_gen):
+  def _compute_stats(self):
     # NOTE Norm-2 is employed in the original code although norm-1 is mentioned
     # on the paper
-    return tf.linalg.norm(tf.math.subtract( acf_gen, self.acf_data), ord = 2, axis = 0 )
+    return tf.linalg.norm(tf.math.divide(tf.math.subtract( self.acf_gen, self.acf_data), self.i), ord = 2, axis = 0 )
 
   def retrieve(self):
+    self.acf_per_feature = self._compute_stats() #[batch, tempo, fazenda]
+    self.total_acf       = tf.math.reduce_mean( self.acf_per_feature )
     self.print
     return self.total_acf
 
@@ -47,6 +56,7 @@ class ACF(ScalarEff,GenerativeEffMeter):
     self.total_acf = 0.
     self.acf_gen = []
     self.i = 0
+    self.initialized = False
 
 @tf.function
 def acf_tf(x, start_lag = 1, stop_lag = 2, dim=(0,1)):

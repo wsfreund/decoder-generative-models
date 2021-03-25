@@ -27,6 +27,7 @@ class DecoderGenerator(TrainBase):
     self._critic_opt               = retrieve_kw(kw, 'critic_opt',               tf.optimizers.RMSprop(lr=1e-4, rho=.5)  )
     self._transform_to_meter_input = retrieve_kw(kw, 'transform_to_meter_input', lambda x: x                  )
     self._n_pretrain_critic        = retrieve_kw(kw, 'n_pretrain_critic',        None                         )
+    self._n_batches                = retrieve_kw(kw, 'n_batches',                2**5                         )
     super().__init__(data_sampler = data_sampler, **kw)
     # Define loss keys
     self._surrogate_lkeys |= {"critic_data", "critic_gen", "critic_total"}
@@ -54,30 +55,13 @@ class DecoderGenerator(TrainBase):
     final_loss_dict = {}
     if not gen_meters and not critic_meters:
       return final_loss_dict
-    ## Prepare data
-    sample_batch = self.sample_parser_fcn(next(iter(sampler_ds)))
-    n_samples = sample_batch[0].shape[0]
-    # TODO If we need different size of latent data, then the sampling of
-    # latent data should be on the meters. Or think on another solution
-    self._cache_performance_latent( n_samples )
-    latent_data = self._performance_latent_data[:n_samples,...]
-    #
-    self._generator_batch = self.sample_generator_input(sample_batch
-        , latent_data = latent_data
-    )
-    gen_batch = self.transform( self._generator_batch )
-    # Make sure we are working on the correct format:
-    data_meter_batch = self._transform_to_meter_input( sample_batch )
-    gen_meter_batch = self._transform_to_meter_input( gen_batch )
-    ## -- end of Prepare data
-    def lrun( data, gen, lmeters ):
-      for meter in lmeters:
-        meter.initialize(data, gen)
-      for meter in lmeters:
-        meter.reset()
+
+    def lrun( ldata, lgen, lmeters ):
       # Accumulate gens
       for meter in lmeters:
-        meter.accumulate(gen)
+        meter.reset()
+        meter.initialize(ldata)
+        meter.accumulate(lgen)
       # Retrieve efficiencies by computing summary statistics
       for meter in lmeters:
         # Keep track of results
@@ -91,11 +75,45 @@ class DecoderGenerator(TrainBase):
           final_loss_dict["wasserstein"] = wasserstein
         else:
           final_loss_dict[meter.name] = meter.retrieve()
+
+
+    sample_batch_list = []
+    gen_batch_list = []
+
+    data_meter_batch_list = []
+    gen_meter_batch_list = []
+    
+    self._cache_performance_latent( self._n_perf_samples )
+    iter_samples = iter(sampler_ds)
+
+    for i in range(self._n_batches):  
+      ## Prepare data
+      sample_batch = self.sample_parser_fcn(next(iter_samples))
+      n_samples = sample_batch[0].shape[0]
+      # TODO If we need different size of latent data, then the sampling of
+      # latent data should be on the meters. Or think on another solution
+      latent_data = self._performance_latent_data[:n_samples,...]
+      #
+      self._generator_batch = self.sample_generator_input(sample_batch
+          , latent_data = latent_data
+      )
+      gen_batch = self.transform( self._generator_batch )
+      # Make sure we are working on the correct format:
+      data_meter_batch = self._transform_to_meter_input( sample_batch )
+      gen_meter_batch = self._transform_to_meter_input( gen_batch )
+      ## -- end of Prepare data
+      
+      sample_batch_list.append(sample_batch)
+      gen_batch_list.append(gen_batch)
+      data_meter_batch_list.append(data_meter_batch)
+      gen_meter_batch_list.append(gen_meter_batch)
+
     # Run:
-    lrun( data_meter_batch, gen_meter_batch, gen_meters)
+    lrun( data_meter_batch_list, gen_meter_batch_list, gen_meters)
     # XXX Find a better approach to CriticEffMeter
+
     if critic_meters:
-      lrun( sample_batch, gen_batch, critic_meters)
+      lrun( sample_batch_list, gen_batch_list, critic_meters)
     return final_loss_dict
 
   def sample_generator_input(self, sampled_input = None, latent_data = None, n_samples = None):

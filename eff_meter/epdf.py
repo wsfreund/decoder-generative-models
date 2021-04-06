@@ -1,94 +1,65 @@
-from .meter_base import ScalarEff, GenerativeEffMeter
+from .meter_base import GenerativeEffMeter
 from ..misc import *
 
 import tensorflow as tf
 import numpy as np
+import itertools
 
-class ePDF(ScalarEff,GenerativeEffMeter):
+class ePDFMeter(GenerativeEffMeter):
 
-  def __init__(self, name = "ePDF", range_value = None):
-    super().__init__(name)
+  def __init__(self, range_value, name = "ePDF", data_parser = lambda x: x
+              , gen_parser = lambda x: x, nbins = 50):
+    super().__init__(name, data_parser, gen_parser)
+    if not isinstance(range_value, np.ndarray):
+      range_value = np.ndarray(range_value)
     self.range_value = range_value
+    self.nbins = nbins
+    self.xs = None
+    self.dfR = None
+    self.dfG = None
 
-  def initialize(self, x_g1_list, x_g2 = None, xmask_g1 = None, xmask_g2 = None):
-    if self.initialized:
-      return
-    if xmask_g1 is not None or xmask_g2 is not None:
-      raise NotImplementedError("ePDF is not currently implemented for masked data")
-    self.reset()
-    self.edges = []
-    self.dfR = []
-    
-    self.initialized = True
-    
-    # for x_g1 in x_g1_list:
-    #   self.xs = x_g1.shape
-    #   # NOTE dfR and dfG are currently flattened
-    #   for t in range(self.xs[1]):
-    #     for d in range(self.xs[2]):
-    #       dfR, edges = np.histogram(x_g1[:,t,d], bins='auto', density=True, range=self.range_value[t][d])
-    #       self.edges.append(edges)
-    #       self.dfR.append(dfR)
-          
-    
-    self.xs = x_g1_list[0].shape
-    # NOTE dfR and dfG are currently flattened
-    for t in range(self.xs[1]):
-      for d in range(self.xs[2]):
-        lx_g1=[]
-        for x_g1 in x_g1_list:
-          lx_g1.append(x_g1[:,t,d])
-        dfR, edges = np.histogram(lx_g1, bins='auto', density=True, range=self.range_value[t][d])
-        self.edges.append(edges)
-        self.dfR.append(dfR)
+  def update_on_parsed_data(self, data, mask):
+    if mask is not None:
+      raise NotImplementedError("%s is not currently implemented for masked data" % self.__class__.__name__)
+    if self.xs is None:
+      self.xs = data.shape
+      self.dfR = np.ndarray(self.xs[1:], dtype=np.object)
+      self.dfG = np.ndarray(self.xs[1:], dtype=np.object)
+    for indexes in itertools.product(*map(range,self.xs[1:])):
+      dfR, _ = np.histogram(data[(slice(None),)+indexes].numpy(), bins=self.nbins, density=True, range=self.range_value[indexes])
+      if self.dfR[indexes] is not None:
+        # TODO Check dfR update
+        self.dfR[indexes] += dfR
+      else:
+        self.dfR[indexes] = dfR
 
-  def accumulate(self, x_gen_list, xmask = None ):
-    if xmask is not None:
-      raise NotImplementedError("ePDF is not currently implemented for masked data")
-    # if self.i > 0:
-    #   raise NotImplementedError("ePDF is not able to work with multiple minibatches")
-    # TODO How to save the histogram through time?
-    # "Custom scalar"? Customize histogram?
-
-    self.start
-    
-    # for x_gen in x_gen_list:
-    #   eiter = iter(self.edges)
-    #   for t in range(self.xs[1]):
-    #     for d in range(self.xs[2]):
-    #       dfG = np.histogram(x_gen[:,t,d], bins=next(eiter), density=True)[0]
-    #       self.dfG.append(dfG)
-    #   self.i += 1
-    # self.stop
-    
-    eiter = iter(self.edges)
-    for t in range(self.xs[1]):
-      for d in range(self.xs[2]):
-        lx_gen = []
-        for x_gen in x_gen_list:
-          lx_gen.append(x_gen[:,t,d])
-        dfG = np.histogram(x_gen[:,t,d], bins=next(eiter), density=True)[0]
-        self.dfG.append(dfG)
-        
-    self.stop
+  def update_on_parsed_gen(self, data, mask = None ):
+    if mask is not None:
+      raise NotImplementedError("%s is not currently implemented for masked data" % self.__class__.__name__)
+    for indexes in itertools.product(*map(range,self.xs[1:])):
+      dfG, _ = np.histogram(data[(slice(None),)+indexes].numpy(), bins=self.nbins, density=True, range=self.range_value[indexes])
+      if self.dfG[indexes] is not None:
+        self.dfG[indexes] += dfG
+      else:
+        self.dfG[indexes] = dfG
 
   def retrieve(self):
-    # print("xs:", self.xs)
-    # print("edges:", self.edges)
-    # print("dfR:", self.dfR)
-    # print("dfG:", self.dfG)
-    self.start
-    self.ePDF = 0.
-    for dfR, dfG in zip(self.dfR, self.dfG):
-      self.ePDF += tf.reduce_mean( tf.math.abs( dfR - dfG ) )
-    self.ePDF /= len(self.dfR)
-    self.stop
-    self.print
-    return self.ePDF
+    if not self._locked_data_statistics:
+      for indexes in itertools.product(*map(range,self.dfR.shape)):
+        self.dfR[indexes] /= self.data_batch_counter
+      self._locked_data_statistics = True
+    for indexes in itertools.product(*map(range,self.dfG.shape)):
+      self.dfG[indexes] /= self.gen_batch_counter
+    ePDF = 0.
+    self.ePDF_per_feature = np.zeros( self.dfR.shape, dtype = np.float32 )
+    for indexes in itertools.product(*map(range,self.dfR.shape)):
+      result = np.mean( np.abs( self.dfR[indexes] - self.dfG[indexes] ) )
+      self.ePDF_per_feature[indexes] = result
+      ePDF += result
+      # TODO  keep record of the reduced statistics
+    ePDF /= np.prod(self.dfR.shape)
+    return { self.name : ePDF }
 
   def reset(self):
     super().reset()
-    self.ePDF = 0.
-    self.i = 0
-    self.dfG = []
-    self.initialized = False
+    self.dfG = np.ndarray(self.xs[1:], dtype=np.object)

@@ -28,14 +28,13 @@ class AutoEncoder( TrainBase ):
       self._required_models |= {"encoder", "decoder", "reconstructor"}
     super().__init__( **kw )
     # Retrieve optimizer
-    self._ae_opt = retrieve_kw(kw, 'ae_opt', tf.optimizers.Adam() ) 
+    self._ae_opt = self._add_optimizer( "reconstructor", retrieve_kw(kw, 'ae_opt', tf.optimizers.Adam() ) )
+    self._add_optimizer( "encoder", None )
+    self._add_optimizer( "decoder", None )
     # Define loss keys
     self._surrogate_lkeys |= {"ae_total"}
-    self._train_perf_lkeys |= {"ae_total"}
-    self._val_perf_lkeys |= {"ae_total"}
     # Overwrite default early_stopping_key
     self.early_stopping_key = retrieve_kw(kw, 'early_stopping_key', 'ae_total' )
-    self._optimizer_dict.update({ "reconstructor" : self._ae_opt })
     self._model_io_keys |= {"encoder","decoder","reconstructor"}
 
   @tf.function
@@ -95,8 +94,6 @@ class AutoEncoder( TrainBase ):
   def _apply_ae_update( self, ae_tape, ae_loss):
     ae_variables = self.reconstructor.trainable_variables
     ae_grads = ae_tape.gradient(ae_loss, ae_variables)
-    if self._use_grad_clipping:
-      ae_grads = [self._grad_clipping_fcn(g) for g in ae_grads if g is not None]
     self._ae_opt.apply_gradients(zip(ae_grads, ae_variables))
     return
 

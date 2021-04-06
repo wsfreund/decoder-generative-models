@@ -1,7 +1,7 @@
 # MMD functions implemented in tensorflow.
 #   (adapted from https://github.com/ratschlab/RGAN/blob/master/mmd.py)
 
-from .meter_base import ScalarEff, GenerativeEffMeter
+from .meter_base import GenerativeEffMeter
 from ..misc import *
 
 import tensorflow as tf
@@ -23,10 +23,12 @@ def dot(x, y, name=None):
         tf.expand_dims(y, 1)
       ))
 
-class MMD2(ScalarEff,GenerativeEffMeter):
+class MMD2Meter(GenerativeEffMeter):
   """Quadratic-time MMD with Gaussian RBF kernel"""
 
   def __init__(self, name = "MMD2", sigmas = None, biased = True, **kw):
+    # FIXME
+    raise NotImplementedError("MMD2 implemented needs to be updated")
     super().__init__(name)
     self.sigmas                           = sigmas
     self.biased                           = biased

@@ -20,109 +20,112 @@ class DecoderGenerator(TrainBase):
     else:
       self._required_models |= {"generator", "critic",}
     # TODO Set default optimizer to adam with zero momentum!
-    self._n_critic                 = retrieve_kw(kw, 'n_critic',                 0                            )
-    self._result_file              = retrieve_kw(kw, 'result_file',              "weights.decoder_generator"  )
-    self._latent_dim  = tf.constant( retrieve_kw(kw, 'latent_dim',               100                          ), dtype = tf.int64      )
-    self._gen_opt                  = retrieve_kw(kw, 'gen_opt',                  tf.optimizers.RMSprop(lr=1e-4, rho=.5)  )
-    self._critic_opt               = retrieve_kw(kw, 'critic_opt',               tf.optimizers.RMSprop(lr=1e-4, rho=.5)  )
-    self._transform_to_meter_input = retrieve_kw(kw, 'transform_to_meter_input', lambda x: x                  )
-    self._n_pretrain_critic        = retrieve_kw(kw, 'n_pretrain_critic',        None                         )
-    self._n_batches                = retrieve_kw(kw, 'n_batches',                2**5                         )
+    self._n_critic                  = retrieve_kw(kw, 'n_critic',                 0                            )
+    self._result_file               = retrieve_kw(kw, 'result_file',              "weights.decoder_generator"  )
+    self._latent_dim                = tf.constant( retrieve_kw(kw, 'latent_dim',  100                          ), dtype = tf.int32      )
+    self._transform_to_meter_input  = retrieve_kw(kw, 'transform_to_meter_input', lambda x: x                  )
+    self._n_pretrain_critic         = retrieve_kw(kw, 'n_pretrain_critic',        None                         )
+    self._cache_performance_latent  = retrieve_kw(kw, 'cache_performance_latent', True                         )
+    self._n_latent_performance_batches = retrieve_kw(kw, 'n_latent_performance_batches', 'performance_ds_cardinality' )
     super().__init__(data_sampler = data_sampler, **kw)
     # Define loss keys
     self._surrogate_lkeys |= {"critic_data", "critic_gen", "critic_total"}
-    self._train_perf_lkeys |= set(["critic_data", "critic_gen",]) if [m for m in self._train_perf_meters if isinstance(m, CriticEffMeter)] else set()
-    self._val_perf_lkeys |= set(["critic_data", "critic_gen",]) if [m for m in self._val_perf_meters if isinstance(m, CriticEffMeter)] else set()
-    # XXX
-    if "critic" in self._surrogate_lkeys:  self._surrogate_lkeys.remove("critic")
-    if "critic" in self._train_perf_lkeys: self._train_perf_lkeys.remove("critic")
-    if "critic" in self._val_perf_lkeys:   self._val_perf_lkeys.remove("critic")
-    # Define optimizers
-    self._optimizer_dict.update({ 
-        "generator" : self._gen_opt
-      , "critic" : self._critic_opt
-    })
     self._model_io_keys |= {"generator","critic",}
-    for m in filter(lambda m: isinstance(m, CriticEffMeter), self._train_perf_meters):
-      m.model = self._model_dict["critic"]
-    for m in filter(lambda m: isinstance(m, CriticEffMeter), self._val_perf_meters):
-      m.model = self._model_dict["critic"]
+    # Define optimizers
+    self._gen_opt    = self._add_optimizer( "generator", retrieve_kw(kw, 'gen_opt',  tf.optimizers.RMSprop(lr=1e-4, rho=.5) ) )
+    self._critic_opt = self._add_optimizer( "critic", retrieve_kw(kw, 'critic_opt',  tf.optimizers.RMSprop(lr=1e-4, rho=.5) ) )
+    # Latent dataset for performance evaluation
+    self._cached_filepath_dict = {}
+    # TODO If adding a multiple of latent batches per sample batch, multiuple it on take_n 
+    def get_cardinality(ds):
+      card = ds.cardinality()
+      if card is tf.data.UNKNOWN_CARDINALITY:
+        for card, _ in enumerate(ds): pass
+        card += 1
+      return card
+    if self._n_latent_performance_batches == "performance_ds_cardinality":
+      card_train = get_cardinality(self.data_sampler.evaluation_sampler_from_train_ds)
+      card_val = get_cardinality(self.data_sampler.evaluation_sampler_from_val_ds)
+      card = max(card_train, card_val)
+      take_n = card
+    else:
+      take_n = self._n_latent_performance_batches
+    from copy import copy
+    opts = copy(self.data_sampler.eval_sampler_opts)
+    opts.take_n = take_n
+    latent_cache_path = self.data_sampler._cache_filepath + "_latent_data" if self._cache_performance_latent else ''
+    self._latent_sampler_performance_ds = self.latent_sampler_ds_factory( opts, latent_cache_path )
+    # Force cache latent data
+    for _ in self._latent_sampler_performance_ds: pass
 
   def performance_measure_fcn(self, sampler_ds, meters, lc):
-    gen_meters = list(filter(lambda m: isinstance(m,GenerativeEffMeter) and not isinstance(m,CriticEffMeter), meters))
-    critic_meters = list(filter(lambda m: isinstance(m,CriticEffMeter), meters))
-    # FIXME Currently only works for single batch
-    final_loss_dict = {}
-    if not gen_meters and not critic_meters:
-      return final_loss_dict
+    ret = {}
+    # Loop over data samples
+    for i, sample_batch in enumerate(sampler_ds):
+      sample_batch = self.sample_parser_fcn( sample_batch )
+      # TODO If needed, sample multiple batches per sample batch
+      for meter in meters:
+        meter.update_on_data_batch( sample_batch )
+    # Loop over transported latent samples
+    sample_iter = iter(sampler_ds)
+    for latent_data in self._latent_sampler_performance_ds:
+      for meter in meters:
+        if isinstance(meter, GenerativeEffMeter):
+          # FIXME This implementation can be improved
+          sample_batch, sample_iter = self._secure_sample(sample_iter,sampler_ds)
+          sample_batch = self.sample_parser_fcn( sample_batch )
+          # Retrieve generator equivalent data
+          generator_batch = self.sample_generator_input(
+                sampled_input = sample_batch
+              , latent_data = latent_data
+          )
+          gen_batch = self.transform( generator_batch )
+          meter.update_on_gen_batch( gen_batch )
+    # Retrieve results
+    for meter in meters:
+      ret.update(meter.retrieve())
+      meter.reset()
+    return ret
 
-    def lrun( ldata, lgen, lmeters ):
-      # Accumulate gens
-      for meter in lmeters:
-        meter.reset()
-        meter.initialize(ldata)
-        meter.accumulate(lgen)
-      # Retrieve efficiencies by computing summary statistics
-      for meter in lmeters:
-        # Keep track of results
-        if isinstance(meter, CriticEffMeter): # XXX
-          # Write on data summary
-          critic_gen = meter.retrieve( gen = True )
-          critic_data = meter.retrieve( gen = False )
-          wasserstein = critic_data - critic_gen
-          final_loss_dict[meter.name + "_gen"] = critic_gen
-          final_loss_dict[meter.name + "_data"] = critic_data
-          final_loss_dict["wasserstein"] = wasserstein
-        else:
-          final_loss_dict[meter.name] = meter.retrieve()
+  def _secure_sample(self, sample_iter, sampler_ds):
+    try:
+      return next(sample_iter), sample_iter
+    except StopIteration:
+      sample_iter = iter(sampler_ds)
+      return next(sample_iter), sample_iter
 
-
-    sample_batch_list = []
-    gen_batch_list = []
-
-    data_meter_batch_list = []
-    gen_meter_batch_list = []
-    
-    self._cache_performance_latent( self._n_perf_samples )
-    iter_samples = iter(sampler_ds)
-
-    for i in range(self._n_batches):  
-      ## Prepare data
-      sample_batch = self.sample_parser_fcn(next(iter_samples))
-      n_samples = sample_batch[0].shape[0]
-      # TODO If we need different size of latent data, then the sampling of
-      # latent data should be on the meters. Or think on another solution
-      latent_data = self._performance_latent_data[:n_samples,...]
-      #
-      self._generator_batch = self.sample_generator_input(sample_batch
-          , latent_data = latent_data
-      )
-      gen_batch = self.transform( self._generator_batch )
-      # Make sure we are working on the correct format:
-      data_meter_batch = self._transform_to_meter_input( sample_batch )
-      gen_meter_batch = self._transform_to_meter_input( gen_batch )
-      ## -- end of Prepare data
-      
-      sample_batch_list.append(sample_batch)
-      gen_batch_list.append(gen_batch)
-      data_meter_batch_list.append(data_meter_batch)
-      gen_meter_batch_list.append(gen_meter_batch)
-
-    # Run:
-    lrun( data_meter_batch_list, gen_meter_batch_list, gen_meters)
-    # XXX Find a better approach to CriticEffMeter
-
-    if critic_meters:
-      lrun( sample_batch_list, gen_batch_list, critic_meters)
-    return final_loss_dict
+  def latent_sampler_ds_factory(self, opts, cache_filepath):
+    # NOTE: opts.take_n is the total number of batches, instead of the total number of examples
+    def infinite_generator():
+      while True:
+        yield self.sample_latent(opts.batch_size)
+    ds = tf.data.Dataset.from_generator(
+          infinite_generator
+        , output_signature=tf.TensorSpec(shape=(opts.batch_size,self._latent_dim), dtype=tf.float32)
+    ) # infinite loop dataset
+    if cache_filepath: cache_filepath += '_batch%d' % opts.batch_size
+    if bool(opts.take_n): # 
+      if cache_filepath: cache_filepath += '_take%d' % opts.take_n
+      ds = ds.take( opts.take_n )
+    if cache_filepath:
+      if cache_filepath not in self._cached_filepath_dict:
+        mkdir_p(cache_filepath)
+        ds = ds.cache( cache_filepath )
+        self._cached_filepath_dict[cache_filepath] = ds
+      else:
+        ds = ds.cache()
+        print("Warning: Caching on memory although specified to cache on disk.\nReason: Dataset at '%s' is already currently being cached." % cache_filepath )
+    if opts.memory_cache:
+      ds = ds.cache()
+    return ds
 
   def sample_generator_input(self, sampled_input = None, latent_data = None, n_samples = None):
-    if n_samples is None and latent_data is None:
-      n_samples = self.data_sampler._batch_size if sampled_input is None else sampled_input.shape[0]
+    if n_samples is None:
+      n_samples = self.data_sampler.training_sampler_opts.batch_size if sampled_input is None else tf.shape(sampled_input)[0]
     if latent_data is None:
       return self.sample_latent(n_samples)
     else:
-      return latent_data
+      return latent_data[:n_samples,...]
 
   def sample_latent(self, n_samples):
     raise NotImplementedError("Overload this method with a latent sampling method")
@@ -136,17 +139,9 @@ class DecoderGenerator(TrainBase):
   def _train_base(self, epoch, step, sample_batch):
     if (self._n_critic and (step % self._n_critic)) or (step != 0 and self._n_pretrain_critic is not None and step < self._n_pretrain_critic):
       # Update only critic
-      loss_dict = self._train_step(sample_batch, critic_only = True)
+      loss_dict = self._train_step( samples = sample_batch, critic_only = True)
     else:
       # Update critic and generator
-      loss_dict = self._train_step(sample_batch, critic_only = False)
+      loss_dict = self._train_step( samples = sample_batch, critic_only = False)
     return loss_dict
-
-  def _cache_performance_latent(self, n_samples):
-    if not hasattr(self,'_performance_latent_data') or n_samples > self._performance_latent_data.shape[0]:
-      # TODO Grow caching tensor on demand
-      # NOTE this approach makes _generator_batch shared between train/val datasets
-      self._performance_latent_data = self.sample_latent( 
-          n_samples = n_samples
-      )
 

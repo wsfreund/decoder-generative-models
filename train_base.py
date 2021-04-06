@@ -84,7 +84,12 @@ class TrainBase(MaskModel):
     # Interval for logging using epoches
     self._print_interval_epoches   = retrieve_kw(kw, 'print_interval_epoches', 5                                                        )
     # Path to log tensorboard data
-    self._tensorboard_log_path     = retrieve_kw(kw, 'tensorboard_log_path', 'tensorboard_logs'                                         )
+    self._tensorboard_log_basepath = retrieve_kw(kw, 'tensorboard_log_path', 'tensorboard_logs'                                         )
+    # Whether to log model training information in tensorboard (master switch)
+    self._log_models_in_tensorboard = retrieve_kw(kw, 'log_models_in_tensorboard', True                                                 )
+    # kwargs to the tensorboard callbacks. Note that the frequencies are always in batches, i.e. update steps, and not epoches.
+    self._tensorboard_callback_kwargs = retrieve_kw(kw, 'tensorboard_callback_kwargs', {}                                               )
+    # TODO log grads and activations
     # String specifying model label
     self._model_name               = retrieve_kw(kw, 'model_name', self.__class__.__name__                                              )
     # String specifying model first initialization time
@@ -105,40 +110,41 @@ class TrainBase(MaskModel):
     self._save_model_at_path       = retrieve_kw(kw, 'save_model_at_path',   "trained_model"                                            )
     # Whether to apply gradient clipping
     self._use_grad_clipping        = tf.constant( retrieve_kw(kw, 'use_grad_clipping', False  ) )
-    # Gradient clipping function
-    self._grad_clipping_fcn        = retrieve_kw(kw, 'grad_clipping_fcn', lambda x: tf.clip_by_norm( x, 2.0 )  )
     # Surrogate plot options
     self._surrogate_plot_xscale    = retrieve_kw(kw, 'surrogate_plot_xscale',  None                                                )
     self._surrogate_plot_yscale    = retrieve_kw(kw, 'surrogate_plot_yscale',  'linear'                                            )
     # Surrogate plot options
     self._perf_plot_xscale         = retrieve_kw(kw, 'perf_plot_xscale',  None                                                     )
     self._perf_plot_yscale         = retrieve_kw(kw, 'perf_plot_yscale',  {}                                                       )
+    # Other performance logging functions (performance dict is passed as parameter):
+    self._other_surrogate_logging_fcns  = retrieve_kw(kw, 'other_surrogate_logging_fcns',  [] )
+    self._other_train_perf_logging_fcns = retrieve_kw(kw, 'other_train_perf_logging_fcns', [] )
+    self._other_val_perf_logging_fcns   = retrieve_kw(kw, 'other_val_perf_logging_fcns',   [] )
     # Maximum number of samples to use when evaluating performance
     ## Setup
-    if self._tensorboard_log_path:
+    if self._tensorboard_log_basepath:
       tensorboard_key = os.path.expandvars("$TENSORBOARD_LOGGING_KEY")
       user = os.path.expandvars("$USER")
       if tensorboard_key != "$TENSORBOARD_LOGGING_KEY":
-        self._tensorboard_log_path += "_" + tensorboard_key
+        self._tensorboard_log_basepath += "_" + tensorboard_key
       elif user != "$USER":
-        self._tensorboard_log_path += "_" + user
+        self._tensorboard_log_basepath += "_" + user
       else:
         pass
     # lkeys and val_lkeys are used to select which losses are to be recorded
     self._surrogate_lkeys  = {"step",}
-    self._train_perf_lkeys = {"step",} | set(map(lambda m: m.name, self._train_perf_meters))
-    self._val_perf_lkeys   = {"step",} | set(map(lambda m: m.name, self._val_perf_meters))
     self._model_dict = {}
+    self._tensorboard_callback_dict = {}
     self._optimizer_dict = {}
     # Define summary writers:
-    if self._tensorboard_log_path:  
+    if self._tensorboard_log_basepath:  
       self._surrogate_summary_writer  = self._create_writer( "surrogate" )
       self._train_perf_summary_writer = self._create_writer( "train_perf" )
       self._val_perf_summary_writer   = self._create_writer( "val_perf" )
     else:
-      self._surrogate_summary_writer  = contextlib.suppress()
-      self._train_perf_summary_writer = contextlib.suppress()
-      self._val_perf_summary_writer   = contextlib.suppress()
+      self._surrogate_summary_writer  = tf.summary.create_noop_writer()
+      self._train_perf_summary_writer = tf.summary.create_noop_writer()
+      self._val_perf_summary_writer   = tf.summary.create_noop_writer()
     ## build models
     if not hasattr(self,'_required_models'):
       raise RuntimeError("Class '%s' does not define any required model." % self.__class__.__name__)
@@ -152,8 +158,10 @@ class TrainBase(MaskModel):
       assert isinstance(self._print_interval_wall_time, datetime.timedelta)
     for meter in self._train_perf_meters:
       assert isinstance(meter,EffMeterBase)
+      meter.initialize(self)
     for meter in self._val_perf_meters:
       assert isinstance(meter,EffMeterBase)
+      meter.initialize(self)
     assert self._surrogate_plot_xscale in ("log","linear", "mix", None, NotSet)
     assert self._surrogate_plot_yscale in ("log","linear")
     assert self._perf_plot_xscale in ("log","linear", "mix", None, NotSet)
@@ -162,41 +170,42 @@ class TrainBase(MaskModel):
   def train(self, fine_tuning = False):
     self._check_required_models()
     start_train_wall_time = datetime.datetime.now()
+    for callback in self._tensorboard_callback_dict.values():
+      callback.on_train_begin()
     gpus = tf.config.experimental.list_physical_devices('GPU')
     n_gpus = len(gpus)
     if self._verbose: print('This machine has %i GPUs.' % n_gpus)
 
     # containers for losses
-    lc = Container()
+    lc = Container(); self.lc =lc
     if self._load_model_at_path is not None:
       # Load model
       self.load( self._load_model_at_path )
       # Load loss record
       loss_data = self.load( self._load_model_at_path, return_loss = True)
-      try:
-        lc.surrogate_loss_record  = loss_data["surrogate_loss_record"]
-      except KeyError:
-        lc.surrogate_loss_record  = loss_data["train_record"]
-      try:
-        lc.train_perf_record  = loss_data["train_perf_record"]
-      except KeyError:
-        lc.train_perf_record = {k : [] for k in self._train_perf_lkeys}
-      try:
-        lc.val_perf_record  = loss_data["val_perf_record"]
-      except KeyError:
-        lc.val_perf_record  = loss_data["val_record"]
+      lc.surrogate_loss_record  = loss_data["surrogate_loss_record"]
+      lc.train_perf_record  = loss_data["train_perf_record"]
+      lc.val_perf_record  = loss_data["val_perf_record"]
       # Load local_keys
       lc.__dict__.update( self.load( self._load_model_at_path, return_locals = True) )
+      if not hasattr(lc,"total_performance_measure_time"):
+        lc.total_performance_measure_time = datetime.timedelta()
+      if not hasattr(lc,"prev_train_time"):
+        lc.prev_train_time = datetime.timedelta()
+      else:
+        # Update session train time
+        lc.prev_train_time += lc.session_train_time
       # Save a model copy with previous best validation so that if this
       # training is useless, we can recover previous best model
       self.save( overwrite = True, val = True )
     else:
       lc.surrogate_loss_record = {k : [] for k in self._surrogate_lkeys}
-      lc.train_perf_record = {k : [] for k in self._train_perf_lkeys}
-      lc.val_perf_record = {k : [] for k in self._val_perf_lkeys}
+      lc.train_perf_record = {}; lc.val_perf_record = {}
       lc.best_epoch = lc.best_step = lc.last_progress_step = 0; lc.best_val_reco = np.finfo( dtype = np.float32 ).max
       lc.p_sample_period = -np.inf; lc._history_cur_batch_samples = 0;
       lc.step = lc.epoch = 0
+      lc.prev_train_time = 0
+      lc.total_performance_measure_time = datetime.timedelta()
     last_print_cycle = -1; last_save_cycle = 0
     skipFinalPerfEval = is_new_print_cycle = False;
     exc_type = exc_val =  None
@@ -206,162 +215,184 @@ class TrainBase(MaskModel):
 
     train_perf_dict = {}
     val_perf_dict = {}
-    first_step = True
-    total_performance_measure_time = datetime.timedelta()
-    last_performance_measure_time = datetime.timedelta()
-    first_step_measure_time = datetime.timedelta()
+    lc.first_step = True
+    lc.session_performance_measure_time = datetime.timedelta()
+    lc.last_performance_measure_time = datetime.timedelta()
+    lc.first_step_measure_time = datetime.timedelta()
+    lc.session_step = 0
+    lc.session_epoch = 0
     n_measurements = 0
 
     try:
       while (lc.epoch < self._max_epoches if self._max_epoches else True):
         alreadyPrintedEpoch = alreadySavedEpoch = False
         for sample_batch in self.data_sampler.training_sampler:
-          evaluatedPerf = False
-          # TODO To measure performance on purely initialize sample, simply run
-          # below without running self._train_base and without incrementing
-          # lc.step
-          if self.sample_parser_fcn is not None:
-            sample_batch = self.sample_parser_fcn(sample_batch)
-          #print("Running first train step")
-          surrogate_loss_dict = self._train_base(lc.epoch, lc.step, sample_batch)
-          #print("Finished computing and updating one train step")
-          lc.step += 1
-          start_performance_measure = datetime.datetime.now()
-          surrogate_loss_dict = self._parse_surrogate_loss( surrogate_loss_dict )
-          surrogate_loss_dict['step'] = lc.step
-          # Keep track of training record:
-          # TODO This should be integrated in the meters, i.e. compute loss only if passing constraint below
-          c_sample_period = np.log10( lc.step ) // self._log_sampling_period
-          if c_sample_period  > lc.p_sample_period:
-            lc.p_sample_period = c_sample_period
-            lc._history_cur_batch_samples = 0
-          if lc._history_cur_batch_samples < self._history_max_batch_samples:
-            # NOTE handle_new_loss_step keeps track of what is plot/logged
-            # during training
-            # TODO This should be integrated with the meter framework
-            #print("Keeping track of surrogate loss")
-            with (self._surrogate_summary_writer.as_default(step = lc.step) if hasattr(self._train_perf_summary_writer, 'as_default') 
-                else self._surrogate_summary_writer ) as writer:
-              self._handle_new_loss_step(lc.surrogate_loss_record, surrogate_loss_dict, write_to_summary = writer is not None )
-          # Compute efficiency
-          if ( not(lc.step % self._n_performance_measure_steps) or lc.step == 1) and self._has_performance_measure_fcn:
-            n_measurements += 1
-            #print("Computing train dataset performance")
-            #if lc._history_cur_batch_samples < self._history_max_batch_samples:
-            with (self._train_perf_summary_writer.as_default(step = lc.step) if hasattr(self._train_perf_summary_writer, 'as_default') 
-                else self._train_perf_summary_writer ) as writer:
+          with DelayedKeyboardInterrupt():
+            if self._log_models_in_tensorboard:
+              for callback in self._tensorboard_callback_dict.values():
+                callback.on_epoch_begin(epoch = lc.step)
+                callback.on_train_batch_begin(batch = lc.step)
+            evaluatedPerf = False
+            # TODO To measure performance on purely initialize sample, simply run
+            # below without running self._train_base and without incrementing
+            # lc.step
+            if self.sample_parser_fcn is not None:
+              sample_batch = self.sample_parser_fcn(sample_batch)
+            #print("Running first train step")
+            surrogate_loss_dict = self._train_base(lc.epoch, lc.step, sample_batch)
+            #print("Finished computing and updating one train step")
+            lc.step += 1; lc.session_step += 1
+            start_performance_measure = datetime.datetime.now()
+            surrogate_loss_dict = self._parse_surrogate_loss( surrogate_loss_dict )
+            surrogate_loss_dict['step'] = lc.step
+            # Keep track of training record:
+            # TODO This should be integrated in the meters, i.e. compute loss only if passing constraint below
+            c_sample_period = np.log10( lc.step ) // self._log_sampling_period
+            if c_sample_period  > lc.p_sample_period:
+              lc.p_sample_period = c_sample_period
+              lc._history_cur_batch_samples = 0
+            if lc._history_cur_batch_samples < self._history_max_batch_samples:
+              # NOTE handle_new_loss_step keeps track of what is plot/logged
+              # during training
+              # TODO This should be integrated with the meter framework
+              #print("Keeping track of surrogate loss")
+              with self._surrogate_summary_writer.as_default(step = lc.step) as writer:
+                self._handle_new_loss_step( lc.surrogate_loss_record, surrogate_loss_dict
+                                          , keys = self._surrogate_lkeys )
+                for fcn in self._other_surrogate_logging_fcns:
+                  fcn(surrogate_loss_dict)
+            # Compute efficiency
+            if ( not(lc.step % self._n_performance_measure_steps) or lc.step == 1):
+              n_measurements += 1
+              #print("Computing train dataset performance")
+              #if lc._history_cur_batch_samples < self._history_max_batch_samples:
               train_perf_dict = self.performance_measure_fcn(
                   sampler_ds = self.data_sampler.evaluation_sampler_from_train_ds,
                   meters = self._train_perf_meters, lc = lc)
               train_perf_dict['step'] = lc.step
-              self._handle_new_loss_step(lc.train_perf_record, train_perf_dict, keys = self._train_perf_lkeys, write_to_summary = writer is not None )
-            # Compute performance for validation dataset (when available)
-            if self.data_sampler.has_val_ds:
-              #print("Computing val dataset performance")
-              with (self._val_perf_summary_writer.as_default(step = lc.step) if hasattr(self._val_perf_summary_writer, 'as_default') 
-                  else self._val_perf_summary_writer ) as writer:
+              with self._train_perf_summary_writer.as_default(step = lc.step) as writer:
+                self._handle_new_loss_step(lc.train_perf_record, train_perf_dict)
+                for fcn in self._other_train_perf_logging_fcns:
+                  fcn(train_perf_dict)
+              # Compute performance for validation dataset (when available)
+              if self.data_sampler.has_val_ds:
+                #print("Computing val dataset performance")
                 val_perf_dict = self.performance_measure_fcn(
                     sampler_ds = self.data_sampler.evaluation_sampler_from_val_ds,
                     meters = self._val_perf_meters, lc = lc )
                 val_perf_dict['step'] = lc.step
                 evaluatedPerf = True
-                # TODO Reminder handle new loss keeps track of what is plot/logged
-                # during training. Should be integrated with meter framework
-                #if lc._history_cur_batch_samples < self._history_max_batch_samples:
-                self._handle_new_loss_step(lc.val_perf_record, val_perf_dict, keys = self._val_perf_lkeys, write_to_summary = writer is not None )
-              # Early stopping algo: Keep track of best model so far
-              #print("Computing early stopping")
-              if val_perf_dict[self.early_stopping_key] < lc.best_val_reco:
-                if lc.best_val_reco - val_perf_dict[self.early_stopping_key] > self._min_progress:
-                  lc.last_progress_step = lc.step
-                lc.best_val_reco = val_perf_dict[self.early_stopping_key]
-                lc.best_step = lc.step; lc.best_epoch = lc.epoch 
-                self.save( overwrite = True, val = True )
-              # Check whether to break due to 
-              if ( lc.step - lc.last_progress_step ) >= self._max_fail:
-                raise BreakDueToMaxFail()
-          # End of efficiency computation
-          # Performed one model update step
-          # Compute training time
-          train_time = datetime.datetime.now() - start_train_wall_time
-          print_cycle = int( train_time / self._print_interval_wall_time ) if self._print_interval_wall_time is not None else 0
-          is_new_print_cycle = print_cycle > last_print_cycle
-          # Compute performance measurement time:
-          stop_performance_measure = datetime.datetime.now()
-          this_step_performance_measure_time = stop_performance_measure - start_performance_measure
-          if evaluatedPerf:
-            total_performance_measure_time += this_step_performance_measure_time
-            last_performance_measure_time = this_step_performance_measure_time
-            if first_step:
-              first_step_measure_time = this_step_performance_measure_time
-              first_step = False
-          # Print/plot loss
-          if ((self._verbose or self._online_train_plot) and 
-                (
-                  (not(lc.step % self._print_interval_steps) if self._print_interval_steps is not None else False) 
-                  or ((not(lc.epoch % self._print_interval_epoches)  if self._print_interval_epoches is not None else False) and not(alreadyPrintedEpoch) )
-                  or is_new_print_cycle
-                )
-              ):
-            #print("Proceeding to printing")
-            last_improvement = { 'best_val_reco' : lc.best_val_reco
-                               , 'best_step' : lc.best_step
-                               , 'last_progress_step' : lc.last_progress_step } if val_perf_dict else {}
-            if self._online_train_plot:
-              try:
-                from google.colab import output
-                output.clear()
-              except ImportError:
-                from IPython.display import clear_output
-                clear_output(wait = True)
-              plt.close('all')
-              self._plot_surrogate_progress( lc.surrogate_loss_record )
-              self._plot_performance_progress( lc.train_perf_record, lc.val_perf_record )
-              for fcn in self._online_plot_fcns:
-                fcn()
-            if self._verbose: 
-              self._replace_nans_with_last_report( surrogate_loss_dict, lc.surrogate_loss_record )
-              self._print_progress( lc.epoch, lc.step
-                                  , train_time, total_performance_measure_time, last_performance_measure_time, first_step_measure_time
-                                  , n_measurements
-                                  , surrogate_loss_dict, train_perf_dict, val_perf_dict, last_improvement )
-            if not(lc.epoch % self._print_interval_epoches) if self._print_interval_epoches is not None else False:
-              alreadyPrintedEpoch = True
-            if is_new_print_cycle:
-              last_print_cycle = print_cycle
-              is_new_print_cycle = False
-          # Finished printing
-          # Check whether we have finished training
-          if self._max_steps is not None and (lc.step > self._max_steps):
-            raise BreakDueToUpdates()
-          if self._max_train_wall_time is not None and (train_time > self._max_train_wall_time):
-            raise BreakDueToWallTime()
-          # No halt requested. Increament counters
-          if lc._history_cur_batch_samples < self._history_max_batch_samples:
-            lc._history_cur_batch_samples += 1
-          save_cycle = int( train_time / self._save_interval_wall_time ) if self._save_interval_wall_time is not None else 0
-          is_new_save_cycle = save_cycle > last_save_cycle
-          # Save progress. Note that this save is not due to early stopping,
-          # but rather to allow recovering current weights regardless of
-          # training status
-          if (
-              (not(lc.step % self._save_interval_steps) if self._save_interval_steps is not None else False) 
-              or ((not(lc.epoch % self._save_interval_epoches)  if self._save_interval_epoches is not None else False) and not(alreadySavedEpoch) )
-              or is_new_save_cycle
-             ):
-            #print("Saving progress")
-            loss_data = { 'surrogate_loss_record' : lc.surrogate_loss_record
-                        , 'train_perf_record' : lc.train_perf_record
-                        , 'val_perf_record' : lc.val_perf_record }
-            self.save( overwrite = True
-                , loss_data = loss_data
-                , locals_data = lc )
-            if not(lc.epoch % self._save_interval_epoches) if self._save_interval_epoches is not None else False:
-              alreadySavedEpoch = True
-            if is_new_save_cycle:
-              last_save_cycle = save_cycle
-              is_new_save_cycle = False
-        lc.epoch += 1
+                with self._val_perf_summary_writer.as_default(step = lc.step) as writer:
+                  # TODO Reminder handle new loss keeps track of what is plot/logged
+                  # during training. Should be integrated with meter framework
+                  self._handle_new_loss_step(lc.val_perf_record, val_perf_dict )
+                  for fcn in self._other_val_perf_logging_fcns:
+                    fcn(val_perf_dict)
+                # Early stopping algo: Keep track of best model so far
+                #print("Computing early stopping")
+                if bool(self.early_stopping_key) and val_perf_dict[self.early_stopping_key] < lc.best_val_reco:
+                  if lc.best_val_reco - val_perf_dict[self.early_stopping_key] > self._min_progress:
+                    lc.last_progress_step = lc.step
+                  lc.best_val_reco = val_perf_dict[self.early_stopping_key]
+                  lc.best_step = lc.step; lc.best_epoch = lc.epoch 
+                  self.save( overwrite = True, val = True )
+                # Check whether to break due to 
+                if ( lc.step - lc.last_progress_step ) >= self._max_fail:
+                  raise BreakDueToMaxFail()
+            # End of efficiency computation
+            # Performed one model update step
+            # Compute training time
+            lc.session_train_time = datetime.datetime.now() - start_train_wall_time
+            print_cycle = int( lc.session_train_time / self._print_interval_wall_time ) if self._print_interval_wall_time is not None else 0
+            is_new_print_cycle = print_cycle > last_print_cycle
+            # Compute performance measurement time:
+            stop_performance_measure = datetime.datetime.now()
+            this_step_performance_measure_time = stop_performance_measure - start_performance_measure
+            if evaluatedPerf:
+              lc.total_performance_measure_time += this_step_performance_measure_time
+              lc.session_performance_measure_time += this_step_performance_measure_time
+              lc.last_performance_measure_time = this_step_performance_measure_time
+              if lc.first_step:
+                lc.first_step_measure_time = this_step_performance_measure_time
+            # Print/plot loss
+            if ((self._verbose or self._online_train_plot) and 
+                  (
+                    (not(lc.step % self._print_interval_steps) if self._print_interval_steps is not None else False) 
+                    or ((not(lc.epoch % self._print_interval_epoches)  if self._print_interval_epoches is not None else False) and not(alreadyPrintedEpoch) )
+                    or is_new_print_cycle
+                  )
+                ):
+              #print("Proceeding to printing")
+              last_improvement = { 'best_val_reco' : lc.best_val_reco
+                                 , 'best_step' : lc.best_step
+                                 , 'last_progress_step' : lc.last_progress_step } if val_perf_dict else {}
+              if self._online_train_plot:
+                try:
+                  from google.colab import output
+                  output.clear()
+                except ImportError:
+                  from IPython.display import clear_output
+                  clear_output(wait = True)
+                plt.close('all')
+                self._plot_surrogate_progress( lc.surrogate_loss_record )
+                self._plot_performance_progress( lc.train_perf_record, lc.val_perf_record )
+                for fcn in self._online_plot_fcns:
+                  fcn()
+              if self._verbose: 
+                self._replace_nans_with_last_report( surrogate_loss_dict, lc.surrogate_loss_record )
+                self._print_progress( lc.epoch, lc.session_epoch, lc.step, lc.session_step
+                                    , lc.prev_train_time, lc.session_train_time, lc.session_performance_measure_time
+                                    , lc.last_performance_measure_time
+                                    , lc.first_step_measure_time
+                                    , n_measurements
+                                    , surrogate_loss_dict, train_perf_dict, val_perf_dict, last_improvement )
+              if not(lc.epoch % self._print_interval_epoches) if self._print_interval_epoches is not None else False:
+                alreadyPrintedEpoch = True
+              if is_new_print_cycle:
+                last_print_cycle = print_cycle
+                is_new_print_cycle = False
+            # Finished printing
+            # Check whether we have finished training
+            if self._max_steps is not None and (lc.step > self._max_steps):
+              raise BreakDueToUpdates()
+            if self._max_train_wall_time is not None and (lc.session_train_time > self._max_train_wall_time):
+              raise BreakDueToWallTime()
+            # No halt requested. Increament counters
+            if lc._history_cur_batch_samples < self._history_max_batch_samples:
+              lc._history_cur_batch_samples += 1
+            save_cycle = int( lc.session_train_time / self._save_interval_wall_time ) if self._save_interval_wall_time is not None else 0
+            is_new_save_cycle = save_cycle > last_save_cycle
+            # Save progress. Note that this save is not due to early stopping,
+            # but rather to allow recovering current weights regardless of
+            # training status
+            if (
+                (not(lc.step % self._save_interval_steps) if self._save_interval_steps is not None else False) 
+                or ((not(lc.epoch % self._save_interval_epoches)  if self._save_interval_epoches is not None else False) and not(alreadySavedEpoch) )
+                or is_new_save_cycle
+               ):
+              #print("Saving progress")
+              loss_data = { 'surrogate_loss_record' : lc.surrogate_loss_record
+                          , 'train_perf_record' : lc.train_perf_record
+                          , 'val_perf_record' : lc.val_perf_record }
+              self.save( overwrite = True
+                  , loss_data = loss_data
+                  , locals_data = lc )
+              if not(lc.epoch % self._save_interval_epoches) if self._save_interval_epoches is not None else False:
+                alreadySavedEpoch = True
+              if is_new_save_cycle:
+                last_save_cycle = save_cycle
+                is_new_save_cycle = False
+            if self._log_models_in_tensorboard:
+              for callback in self._tensorboard_callback_dict.values():
+                callback.on_epoch_end(epoch = lc.step)
+                callback.on_train_batch_end(batch = lc.step)
+            if ( not(lc.step % self._n_performance_measure_steps) or lc.step == 1):
+              self._update_writer_file(self._surrogate_summary_writer)
+              self._update_writer_file(self._train_perf_summary_writer)
+              self._update_writer_file(self._val_perf_summary_writer)
+            lc.first_step = False
+          # end of step, send delayed keyboard interrupt and allow interruptions
+        lc.epoch += 1; lc.session_epoch += 1
         # Performed a full pass through training dataset
       raise BreakDueToEpoches
     except BaseException as e:
@@ -394,49 +425,50 @@ class TrainBase(MaskModel):
         if isinstance( exc_val, BreakDueToNonFinite ):
           print('Reason: found non-finite value!!')
         raise exc_val
-      if self.data_sampler.has_val_ds and self._has_performance_measure_fcn:
+      if self.data_sampler.has_val_ds:
         if not skipFinalPerfEval:
           if not evaluatedPerf:
-            with (self._train_perf_summary_writer.as_default(step = lc.step) if hasattr(self._train_perf_summary_writer, 'as_default') 
-                else self._train_perf_summary_writer) as writer:
+            with self._train_perf_summary_writer.as_default(step = lc.step) as writer:
               train_perf_dict = self.performance_measure_fcn( 
                   sampler_ds = self.data_sampler.evaluation_sampler_from_train_ds,
                   meters = self._train_perf_meters, lc = lc
               )
               train_perf_dict['step'] = lc.step
-              self._handle_new_loss_step(lc.train_perf_record, train_perf_dict, keys = self._train_perf_lkeys, write_to_summary = writer is not None)
-            with (self._val_perf_summary_writer.as_default(step = lc.step) if hasattr(self._val_perf_summary_writer, 'as_default') 
-                else self._val_perf_summary_writer) as writer:
+              self._handle_new_loss_step(lc.train_perf_record, train_perf_dict, write_to_summary = writer is not None)
+            self._update_writer_file(self._train_perf_summary_writer)
+            with self._val_perf_summary_writer.as_default(step = lc.step) as writer:
               val_perf_dict = self.performance_measure_fcn( 
                   sampler_ds = self.data_sampler.evaluation_sampler_from_val_ds,
                   meters = self._val_perf_meters, lc = lc
               )
               val_perf_dict['step'] = lc.step
-              self._handle_new_loss_step(lc.val_perf_record, val_perf_dict, keys = self._val_perf_lkeys, write_to_summary = writer is not None)
-          if lc.step == lc.best_step or val_perf_dict[self.early_stopping_key] < lc.best_val_reco:
-            lc.best_val_reco = val_perf_dict[self.early_stopping_key]
-            lc.best_step = lc.step; lc.best_epoch = lc.epoch 
-          else:
-            print('Validation Performance @ (Epoch %i, Step %i): %f.' % (lc.epoch, lc.step, val_perf_dict[self.early_stopping_key]))
-            print('Recovering Best Validation Performance @ (Epoch %i, Step %i).' % (lc.best_epoch, lc.best_step,))
-            print('Reco_loss: %.3f.' % (lc.best_val_reco))
-            self.load(  self._save_model_at_path, val = True )
-    self.save( save_models_and_optimizers = False
-             , overwrite = True, locals_data = lc )
+              self._handle_new_loss_step(lc.val_perf_record, val_perf_dict, write_to_summary = writer is not None)
+            self._update_writer_file(self._val_perf_summary_writer)
+          if bool(self.early_stopping_key): 
+            if ( lc.step == lc.best_step or val_perf_dict[self.early_stopping_key] < lc.best_val_reco ):
+              lc.best_val_reco = val_perf_dict[self.early_stopping_key]
+              lc.best_step = lc.step; lc.best_epoch = lc.epoch 
+            else:
+              print('Validation Performance @ (Epoch %i, Step %i): %f.' % (lc.epoch, lc.step, val_perf_dict[self.early_stopping_key]))
+              print('Recovering Best Validation Performance @ (Epoch %i, Step %i).' % (lc.best_epoch, lc.best_step,))
+              print('Reco_loss: %.3f.' % (lc.best_val_reco))
+              self.load(  self._save_model_at_path, val = True )
+    self.save( overwrite = True, locals_data = lc )
+    for callback in self._tensorboard_callback_dict.values():
+      callback.on_train_end()
     # Compute final performance:
     final_performance = {}
-    if self._has_performance_measure_fcn:
-      final_performance['train'] = self.performance_measure_fcn(
-          sampler_ds = self.data_sampler.evaluation_sampler_from_train_ds,
-          meters = self._train_perf_meters,  lc = lc )
-      if self.data_sampler.has_val_ds:
-        final_performance['val'] = self.performance_measure_fcn(
-            sampler_ds = self.data_sampler.evaluation_sampler_from_val_ds,
-            meters = self._val_perf_meters, lc = lc )
-        final_performance['val']['best_step'] = lc.best_step
-        final_performance['val']['best_epoch'] = lc.best_epoch
-      else:
-        final_performance['val'] = dict()
+    final_performance['train'] = self.performance_measure_fcn(
+        sampler_ds = self.data_sampler.evaluation_sampler_from_train_ds,
+        meters = self._train_perf_meters,  lc = lc )
+    if self.data_sampler.has_val_ds:
+      final_performance['val'] = self.performance_measure_fcn(
+          sampler_ds = self.data_sampler.evaluation_sampler_from_val_ds,
+          meters = self._val_perf_meters, lc = lc )
+      final_performance['val']['best_step'] = lc.best_step
+      final_performance['val']['best_epoch'] = lc.best_epoch
+    else:
+      final_performance['val'] = dict()
     loss_data = { 'surrogate_loss_record' : lc.surrogate_loss_record
                 , 'train_perf_record' : lc.train_perf_record
                 , 'val_perf_record' : lc.val_perf_record
@@ -448,15 +480,12 @@ class TrainBase(MaskModel):
   def build_models(self):
     raise NotImplementedError("Overload this method returning a dict with the models to be used.")
 
-  def loss_per_dataset(self, fcn = None):
+  def loss_per_dataset(self, fcn = None ):
     if fcn is None:
-      if self._has_performance_measure_fcn: 
-        fcn = self.performance_measure_fcn
-      else:
-        raise ValueError("Performance measure function must be specified")
-    return { 'train': fcn(self.data_sampler.new_sampler_from_train_ds( **self._eval_ds_kwargs ) )
-           , 'val':   fcn(self.data_sampler.new_sampler_from_val_ds( **self._eval_ds_kwargs ) )
-           , 'test':  fcn(self.data_sampler.new_sampler_from_test_ds( **self._eval_ds_kwargs ) ) }
+      fcn = self.performance_measure_fcn
+    return { 'train': fcn(self.data_sampler.evaluation_sampler_from_train_ds, self._train_perf_meters, {} )
+           , 'val':   fcn(self.data_sampler.evaluation_sampler_from_val_ds, self._val_perf_meters, {} )
+           , 'test':  fcn(self.data_sampler.evaluation_sampler_from_test_ds, self._val_perf_meters, {} ) }
 
   def save(self, overwrite = False, save_models_and_optimizers = True, val = False, loss_data = None, locals_data = None ):
     if not self._model_io_keys:
@@ -483,24 +512,28 @@ class TrainBase(MaskModel):
   def _save_model( self, key, model ):
     np.savez( key, np.array(model.get_weights(), dtype=np.object) )
 
+  def _add_optimizer( self, key, optimizer ):
+    self._optimizer_dict[key] = optimizer
+    self._model_dict[key].optimizer = optimizer
+    return optimizer
+
   def _save_optimizer( self, key, optimizer ):
     np.savez( key, np.array(optimizer.get_weights(), dtype=np.object) )
 
-  def load(self, path, val = False, load_optimizer = True, return_loss = False, return_locals = False ):
+  def load(self, path, val = False, return_loss = False, return_locals = False ):
     if not self._model_io_keys:
       raise ValueError("Empty model io keys for class %s" % self.__class__.__name__)
     if not(return_locals or return_loss):
-      if load_optimizer:
-        for ko, optimizer in self._optimizer_dict.items():
-          model = self._model_dict[ko]
-          try:
-            ko += '_opt'
-            if val: ko += '_bestval'
-            ko +=  '.npz'
-            if optimizer is not None:
-              self._load_optimizer(os.path.join(path,ko), optimizer, model)
-          except FileNotFoundError:
-            print("Warning: Could not recover %s optimizer state." % ko)
+      for ko, optimizer in self._optimizer_dict.items():
+        model = self._model_dict[ko]
+        try:
+          ko += '_opt'
+          if val: ko += '_bestval'
+          ko +=  '.npz'
+          if optimizer is not None:
+            self._load_optimizer(os.path.join(path,ko), optimizer, model)
+        except FileNotFoundError:
+          print("Warning: Could not recover %s optimizer state." % ko)
       for k in self._model_io_keys:
         model = self._model_dict[k]
         if val: 
@@ -517,11 +550,30 @@ class TrainBase(MaskModel):
       raw_data = dict(**np.load( locals_data_path, allow_pickle=True))
       return self._treat_numpy_data( raw_data )
 
-  def performance_measure_fcn(self, sampler_ds, meters_dict, lc):
-    raise RuntimeError("Performance measure function is not implemented")
+  def performance_measure_fcn(self, sampler_ds, meters, lc):
+    ret = {}
+    for samples in sampler_ds:
+      for meter in meters:
+        meter.update_on_data_batch( samples )
+    for meter in meters:
+      ret.update(meter.retrieve())
+      meter.reset()
+    return ret
 
   def _create_writer( self, output_place ): 
-    return tf.summary.create_file_writer( os.path.join( self._tensorboard_log_path, self._model_name, self._init_time, output_place ) )
+    # XXX for surpassing colab issues
+    dest = self._tensorboard_log_path( output_place )
+    temp = os.path.join(tempfile._get_default_tempdir(), next(tempfile._get_candidate_names()) ) 
+    writer = tf.summary.create_file_writer( temp )
+    writer.tempdir = temp
+    writer.destdir = dest
+    return writer
+
+  def _tensorboard_log_path( self, output_place ):
+    if self._tensorboard_log_basepath:
+      return os.path.join( self._tensorboard_log_basepath, self._model_name, self._init_time, output_place )
+    else:
+      return None
 
   def _load_model(self, key, model):
     print("Loading %s weights..." % key)
@@ -546,6 +598,7 @@ class TrainBase(MaskModel):
         raise RuntimeError("Model %s was not provided." % model_key )
 
   def _decorate_models(self):
+    profile_batch_counter = 2
     for model_key, model in self._model_dict.items():
       if not hasattr(self,model_key):
         model.compile()
@@ -553,6 +606,18 @@ class TrainBase(MaskModel):
         trainable_count = sum([K.count_params(w) for w in model.trainable_weights])
         if self._verbose: print("%s has %d parameters (%d trainable)" % (model_key, model.count_params(), trainable_count))
         setattr(self,model_key,model)
+        #TODO model.optimizer 
+        if self._log_models_in_tensorboard:
+          import copy
+          callback_kwargs = copy.copy(self._tensorboard_callback_kwargs)
+          if callback_kwargs.get('profile_batch', 2) != 0:
+            callback_kwargs['profile_batch'] = profile_batch_counter
+            profile_batch_counter += 1
+          callback = tf.keras.callbacks.TensorBoard( 
+              log_dir = self._tensorboard_log_path( 'keras_callback_' + model_key), **callback_kwargs
+          )
+          callback.set_model( model )
+          self._tensorboard_callback_dict[model_key] = callback
       else:
         raise RuntimeError("Duplicated model %s." % model_key )
 
@@ -592,8 +657,8 @@ class TrainBase(MaskModel):
   def _plot_performance_progress(self, train_perf_record, val_perf_record):
     from IPython.display import display
     if not hasattr(self,"_perf_fig"):
-      self._all_perf_keys = set(val_perf_record.keys()) | set(train_perf_record.keys())
-      for k in ("step", "critic_gen", "critic_data"): # XXX
+      self._all_perf_keys = sorted(set(val_perf_record.keys()) | set(train_perf_record.keys()))
+      for k in ("step",):
         if k in self._all_perf_keys: 
           self._all_perf_keys.remove(k)
           if k.startswith("critic"):
@@ -616,18 +681,10 @@ class TrainBase(MaskModel):
       ax.plot(steps[idx], v[idx], label=label)
     if len(steps):
       for ax, k in zip(self._all_perf_ax, self._all_perf_keys):
-        if k in train_perf_record or k + "_data" in train_perf_record:
-          if k == "critic": # XXX
-            add_plot(ax, steps, train_perf_record, k + "_data", k + "(data,train)")
-            add_plot(ax, steps, train_perf_record, k + "_gen", k + "(gen,train)")
-          else:
-            add_plot(ax, steps, train_perf_record, k, k + " (train)")
-        if k in val_perf_record or k + "_data" in val_perf_record:
-          if k == "critic": # XXX
-            add_plot(ax, steps, val_perf_record, k + "_data", k + "(data,val)")
-            add_plot(ax, steps, val_perf_record, k + "_gen", k + "(gen,val)")
-          else:
-            add_plot(ax, steps, val_perf_record, k, k + " (val)")
+        if k in train_perf_record:
+          add_plot(ax, steps, train_perf_record, k, k + " (train)")
+        if k in val_perf_record:
+          add_plot(ax, steps, val_perf_record, k, k + " (val)")
         ax.legend(prop={'size': 6})
         ax.autoscale(enable=True, axis='x', tight=True)
         ax.tick_params(axis='both', which='major', labelsize=8)
@@ -643,19 +700,19 @@ class TrainBase(MaskModel):
       return 'linear' if step < int(10e3) else 'log'
     return val
 
-  def _handle_new_loss_step(self, loss_record, loss_dict, keys = None, write_to_summary = False):
-    if keys is None:
-      keys = self._surrogate_lkeys
+  def _handle_new_loss_step(self, loss_record, loss_dict, keys = 'all'):
+    if keys == 'all':
+      keys = loss_dict.keys()
     for k in keys:
       if k in loss_dict:
         eff = loss_dict[k]
-        # TODO if isinstance(eff, Efficiency)
         val = loss_dict[k].numpy() if hasattr(loss_dict[k],"numpy") else loss_dict[k]
         if hasattr(val,"shape") and val.shape: val = val[0]
       else:
         val = np.nan
+      if k not in loss_record: loss_record[k] = []
       loss_record[k].append(val)
-      if write_to_summary and k not in ("step", "critic_fake"): # XXX
+      if k not in ("step",):
         tf.summary.scalar( k, val, step = loss_dict['step'] )
 
   def _replace_nans_with_last_report( self, loss_dict, loss_record, keys = None ):
@@ -687,12 +744,20 @@ class TrainBase(MaskModel):
         raise BreakDueToNonFinite(k)
     return train_loss
 
-  @property
-  def _has_performance_measure_fcn(self): 
-    return hasattr(self,'performance_measure_fcn')
+  def _update_writer_file(self, writer):
+    writer.flush()
+    from shutil import copytree, rmtree
+    with DelayedKeyboardInterrupt():
+      # XXX this is slow
+      if sys.version_info >= (3, 8):
+        copytree(writer.tempdir, writer.destdir,dirs_exist_ok=True)
+      else:
+        rmtree(writer.destdir, ignore_errors=True) # this is dangerous, avoid unexpected interruptions using delayed keyboard interrupt
+        copytree(writer.tempdir, writer.destdir)
 
-  def _print_progress( self, epoch, step
-                     , train_time, total_performance_measure_time, last_performance_measure_time, first_step_measure_time
+  def _print_progress( self, epoch, session_epoch, step, session_step
+                     , prev_train_time, session_train_time
+                     , session_performance_measure_time, last_performance_measure_time, first_step_measure_time
                      , n_measurements
                      , surrogate_loss_dict, train_perf_dict, val_perf_dict
                      , last_improvement ):
@@ -705,54 +770,66 @@ class TrainBase(MaskModel):
     except:
       perc_steps = 0
     try:
-      perc_wall = np.around(100*train_time/self._max_train_wall_time, decimals=1)
+      perc_wall = np.around(100*lc.session_train_time/self._max_train_wall_time, decimals=1)
     except:
       perc_wall = 0
     perc = max(perc_epoches, perc_steps, perc_wall)
     perc = min(perc,100.)
     perc_str = ("%2.1f%%" % perc) if perc >= 0. else '??.?%%'
-    print(('>>Epoch: %i. Steps: %i. Time: %s. Training %s complete.\n::Surrogate: ' % (epoch, step, train_time, perc_str)) + 
+    session_epoch_str = " (sess:%d)" % session_epoch if session_step != step else ''
+    session_step_str = " (sess:%d)" % session_step if session_step != step else ''
+    session_time_str = " (sess:%s)" % session_train_time if session_step != step else ''
+    print(('>>Epoch: %i%s. Steps: %i%s. Time: %s%s. Training %s complete.\n::Surrogate: ' 
+      % (epoch, session_epoch_str, step, session_step_str, prev_train_time+session_train_time, session_time_str, perc_str)) + 
       '; '.join([("%s: %.3f" % (k, v)) for k, v in surrogate_loss_dict.items() if k is not 'step']) + "."
     )
     if train_perf_dict or val_perf_dict:
-      steps_per_second = ( step / ( train_time - total_performance_measure_time ).total_seconds() )
-      lost_steps = total_performance_measure_time.total_seconds() * steps_per_second
-      lost_frac = ( step + lost_steps ) / step  - 1.
-      print('::Performance @ step %i:' % train_perf_dict['step'] )
-      print('...Runtime speed: avg: %.2fit/s.' % steps_per_second )
-      print('...Runtime overhead: last: %s; avg: %s (n=%d); total: %s (eff:%s%%|lost:%4.0f|incr:%s%%); first: %s.' % 
+      steps_per_second = ( session_step / ( session_train_time - session_performance_measure_time ).total_seconds() )
+      lost_steps = session_performance_measure_time.total_seconds() * steps_per_second
+      lost_frac = ( session_step + lost_steps ) / session_step  - 1.
+      print('...Runtime speed> avg: %.2fit/s.' % steps_per_second )
+      print('...Runtime overhead> last: %s; avg: %s (n=%d); session: %s (eff:%s%%|lost:%4.0f|incr:%s%%); first: %s.' % 
             ( last_performance_measure_time
-            , ( total_performance_measure_time - first_step_measure_time ) / ( n_measurements - 1 ) if ( n_measurements - 1 ) > 0 else '---'
+            , ( session_performance_measure_time - first_step_measure_time ) / ( n_measurements - 1 ) if ( n_measurements - 1 ) > 0 else '---'
             , n_measurements
-            , total_performance_measure_time 
-            , np.around(100*(1.-total_performance_measure_time/train_time), decimals=1) 
+            , session_performance_measure_time 
+            , np.around(100*(1.-session_performance_measure_time/session_train_time), decimals=1) 
             , lost_steps
             , np.around(100*lost_frac, decimals=1)
             , first_step_measure_time )
       )
-      #if not hasattr(self,"_last_shown_perf"):
-      #  self._last_shown_perf = -1
-      #if val_perf_dict['step'] != self._last_shown_perf:
-      # self._last_shown_perf = val_perf_dict['step']
+      for meter in self._train_perf_meters:
+        print( '...Runtime overhead breakdown> Train> %s: session: %s (%.1f%%); last: %s;' 
+             % ( meter.name, meter._total_running_time
+               , meter._total_running_time/session_train_time*100.
+               , meter._prev_step_deltatime ) )
+      for meter in self._val_perf_meters:
+        print( '...Runtime overhead breakdown> Val> %s: session: %s (%.1f%%); last: %s;' 
+             % ( meter.name, meter._total_running_time
+               , meter._total_running_time/session_train_time*100.
+               , meter._prev_step_deltatime ) )
+      print('::Performance @ step %i:' % train_perf_dict['step'] )
       if train_perf_dict:
-        print('...Train: ' + self.early_stopping_key + "_train" + (': %.3f; ' % (train_perf_dict[self.early_stopping_key])) +
-          '; '.join([("%s: %.3f" % (k + "_train", v)) for k, v in train_perf_dict.items() if k not in ('step', self.early_stopping_key)]) + '.'
+        print('...Train: ' + 
+            ( self.early_stopping_key + "_train" + (': %.3f; ' % (train_perf_dict[self.early_stopping_key])) if bool(self.early_stopping_key) else '' ) +
+            '; '.join([("%s: %.3f" % (k + "_train", v)) for k, v in train_perf_dict.items() if k not in ('step', self.early_stopping_key)]) + '.'
         )
       if val_perf_dict:
         print('...Validation: ' +
-          self.early_stopping_key + "_val" + (': %.3f; ' % (val_perf_dict[self.early_stopping_key])) +
-          '; '.join([("%s: %.3f" % (k + "_val", v)) for k, v in val_perf_dict.items() if k not in ('step', self.early_stopping_key)]) + '.'
+            ( self.early_stopping_key + "_val" + (': %.3f; ' % (val_perf_dict[self.early_stopping_key])) if bool(self.early_stopping_key) else '' ) +
+            '; '.join([("%s: %.3f" % (k + "_val", v)) for k, v in val_perf_dict.items() if k not in ('step', self.early_stopping_key)]) + '.'
         )
-      if last_improvement:
-        delta_fail = (step - last_improvement['last_progress_step']) if (step - last_improvement['last_progress_step']) > self._n_performance_measure_steps else 0
-        print( ( '...Best Val: %.3f (step=%d) =>'  % 
-            ( last_improvement['best_val_reco']
-            , last_improvement['best_step'] ) )
-            + ( ( ' Fails %s= [%d/%d]' % ( 
-                "(<min prog) " if ( last_improvement['best_step'] != last_improvement['last_progress_step']) else ""
-              , delta_fail
-              , self._max_fail
-              ) ) 
-            if delta_fail 
-            else ' Improved.' )
-        )
+      if bool(self.early_stopping_key):
+        if last_improvement:
+          delta_fail = (step - last_improvement['last_progress_step']) if (step - last_improvement['last_progress_step']) > self._n_performance_measure_steps else 0
+          print( ( '...Best Val: %.3f (step=%d) =>'  % 
+              ( last_improvement['best_val_reco']
+              , last_improvement['best_step'] ) )
+              + ( ( ' Fails %s= [%d/%d]' % ( 
+                  "(<min prog) " if ( last_improvement['best_step'] != last_improvement['last_progress_step']) else ""
+                , delta_fail
+                , self._max_fail
+                ) ) 
+              if delta_fail 
+              else ' Improved.' )
+          )

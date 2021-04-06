@@ -18,8 +18,6 @@ class AutoEncoderWithEmbeddings( ModelWithEmbeddings, AutoEncoder ):
     super().__init__(input_info_dict = input_info_dict, **kw )
     # Define loss keys
     self._surrogate_lkeys  |= {"ae_total", "ae_numerical", "ae_categorical", "ae_sigmoid", "ae_softmax"}
-    self._train_perf_lkeys |= set()
-    self._val_perf_lkeys |= set()
     self._required_models |= {"train_model"} # TODO
     # Define loss function for performance evaluation (not training)
 

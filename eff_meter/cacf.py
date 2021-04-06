@@ -1,10 +1,10 @@
-from .meter_base import ScalarEff, GenerativeEffMeter
+from .meter_base import GenerativeEffMeter
 from ..misc import *
 
 import tensorflow as tf
 import numpy as np
 
-class CACF(ScalarEff,GenerativeEffMeter):
+class CACFMeter(GenerativeEffMeter):
 
   def __init__(self, name = "cACF", start_lag = 0, stop_lag = 1):
     super().__init__(name)

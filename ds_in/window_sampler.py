@@ -43,7 +43,8 @@ class WindowSampler(SamplerBase):
     """
     if "specific_flow_sampling_opt_class" not in kw:
       kw["specific_flow_sampling_opt_class"] = SpecificFlowWindowSamplingOpts
-    super().__init__(manager, **kw)
+    super().__init__( raw_data = manager.df, **kw)
+    self._pp                        = manager.pre_proc
     self.shuffle_buffer_size_window = retrieve_kw(kw, "shuffle_buffer_size_window" )
     self._sample_from_marginals     = retrieve_kw(kw, "sample_from_marginals",      False                                )
     self._keep_marginal_axis        = retrieve_kw(kw, "keep_marginal_axis",         True                                 )
@@ -95,8 +96,9 @@ class WindowSampler(SamplerBase):
     return
 
   def clear_cache(self):
+    # FIXME
     _CacheStorage.clear_cached_functions()
-    SamplingBase.clear_cache(self)
+    SamplerBase.clear_cache(self)
 
   def update_n_cycles(self, n_cycles):
     # Remove all cached information in order to recompute datasets
@@ -186,18 +188,6 @@ class WindowSampler(SamplerBase):
     plt.xlabel('Time [%s]' % self._date_time.freq)
     return
 
-  @property
-  def has_train_ds(self):
-    return hasattr(self,"train_df")
-
-  @property
-  def has_val_ds(self):
-    return hasattr(self,"val_df")
-
-  @property
-  def has_test_ds(self):
-    return hasattr(self,"test_df")
-
   def _cycle_slice(self, cycle_idx=0):
     end = -(self.n_cycles-(cycle_idx+1))*self._cycle_shift
     start = end - self._cycle_width
@@ -206,14 +196,14 @@ class WindowSampler(SamplerBase):
   def _cycle_indices(self, cycle_idx=0):
     return self.full_window_indices[self._cycle_slice(cycle_idx)]
 
-  def _make_dataset( self, df, opts, cache_filepath, memory_cache = False):
+  def _make_dataset( self, df, opts, cache_filepath):
     #start = datetime.datetime.now()
     #print("Building new dataset...")
     # This will not work if attempting to forecast the past:
     try:
       sklearn.utils.validation.check_is_fitted( self._pp )
     except sklearn.exceptions.NotFittedError:
-      self._pp.fit(self.train_df)
+      self._pp.fit(self.raw_train_data)
     opts.set_unset_to_default( self, df )
     # NOTE This slice on features must be removed when adding support to labels
     data = self._pp.transform( df.loc[:,self._features].to_numpy(dtype=np.float32) )
@@ -252,12 +242,12 @@ class WindowSampler(SamplerBase):
         start_index = 0,
         end_index = self.total_window_size,
         input_dataset = ds,
-        sequence_length=self._past_window_size+self._cycle_shift,
-        sequence_stride=self._cycle_shift)
+        sequence_length = self._past_window_size+self._cycle_shift,
+        sequence_stride = self._cycle_shift)
     ds = ds.map(self._extract_data)
     if opts.batch_size is not None:
       ds = ds.batch(opts.batch_size, drop_remainder = opts.drop_remainder)
-    if memory_cache:
+    if opts.memory_cache:
       ds = ds.cache()
     #total_time = datetime.datetime.now() - start
     #print("Finished building dataset in %s." % total_time)
@@ -348,7 +338,7 @@ class WindowSampler(SamplerBase):
     )
     return dataset
 
-  def _split_data(self, df, val_frac, test_frac ):
+  def _split_data(self, df, val_frac, test_frac, **split_kw ):
     # TODO Add compatibility with time-series cross-validation
     # Note that we split without shuffling.
     # The goal is to have realistic generalization conditions, i.e. generalize
@@ -365,17 +355,17 @@ class WindowSampler(SamplerBase):
     full_train_df                 = df[full_train_slice]
     n_tr                          = int(n*full_train_frac)
     train_slice                   = slice(0,int(n_tr*full_train_frac))
-    self.train_df                 = full_train_df[train_slice]
+    self.raw_train_data           = full_train_df[train_slice]
 
     val_slice                     = slice(int(n_tr*train_frac),None)
-    self.val_df                   = full_train_df[val_slice]
-    if hasattr(self.val_df, "reset_index"):
-      self.val_df.reset_index(drop = True,inplace=True)
+    self.raw_val_data             = full_train_df[val_slice]
+    if hasattr(self.raw_val_data, "reset_index"):
+      self.raw_val_data.reset_index(drop = True,inplace=True)
 
     test_slice                    = slice(int(n*full_train_frac)+1,None)
-    self.test_df                  = df[test_slice]
-    if hasattr(self.test_df, "reset_index"):
-      self.test_df.reset_index(drop = True,inplace=True)
+    self.raw_test_data            = df[test_slice]
+    if hasattr(self.raw_test_data, "reset_index"):
+      self.raw_test_data.reset_index(drop = True,inplace=True)
     return
 
   def __repr__(self):

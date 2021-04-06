@@ -1,3 +1,4 @@
+from abc import ABC, abstractmethod
 import numpy as np
 import tensorflow as tf
 import copy
@@ -7,15 +8,17 @@ from ..misc import *
 
 class SpecificFlowSamplingOpts(object):
 
-  def __init__(self, batch_size
-                   , take_n = NotSet, drop_remainder = NotSet
-                   , shuffle = NotSet, shuffle_kwargs = NotSet):
+  def __init__( self, batch_size
+              , take_n = NotSet, drop_remainder = NotSet
+              , shuffle = NotSet, shuffle_kwargs = NotSet
+              , memory_cache = False ):
     assert batch_size is not NotSet
     self.batch_size     = batch_size
     self.take_n         = take_n
     self.drop_remainder = drop_remainder
     self.shuffle        = shuffle
     self.shuffle_kwargs = shuffle_kwargs
+    self.memory_cache   = memory_cache
 
   def set_unset_to_default(self, sampler, df):
     if self.take_n is NotSet:
@@ -33,21 +36,25 @@ class SpecificFlowSamplingOpts(object):
         self.shuffle = True
     if self.shuffle_kwargs is NotSet:
       self.shuffle_kwargs = {}
-    if not "reshuffle_each_iteration" in self.shuffle_kwargs:
+    if "reshuffle_each_iteration" not in self.shuffle_kwargs:
       self.shuffle_kwargs["reshuffle_each_iteration"] = False
+    if "buffer_size" not in self.shuffle_kwargs:
+      if self.batch_size is not None:
+        self.shuffle_kwargs["buffer_size"] = self.batch_size * 8
 
 # FIXME This is a singleton shared within all instances
 # TODO Implement a dict where the key is each instance
 class _CacheStorage(CleareableCache):
   cached_functions = []
 
-class SamplerBase(object):
+class SamplerBase(ABC):
   """
   NOTE: Any modification to sampler object requires removing any previous
   cache_filepath to take effect.
   """
 
-  def __init__(self, manager, **kw ):
+  def __init__( self, raw_data
+              , split_kw = {}, **kw ):
     """
     There are several sampler functions to be used:
     - training_sampler: Iteration considering the training conditions. These
@@ -61,8 +68,7 @@ class SamplerBase(object):
     # Splitting instructions
     self._val_frac                   = retrieve_kw(kw, "val_frac",  .2 )
     self._test_frac                  = retrieve_kw(kw, "test_frac", .2 )
-    self._pp                         = manager.pre_proc
-    self._split_data( manager.df, self._val_frac, self._test_frac )
+    self._split_data( raw_data, self._val_frac, self._test_frac, **split_kw )
     # Specify specific sampling instructions for each dataset
     SpecificOptsCls = retrieve_kw(kw, "specific_flow_sampling_opt_class", SpecificFlowSamplingOpts )
     training_sampler_kwargs  = retrieve_kw(kw, "training_sampler_kwargs", {} )
@@ -87,31 +93,39 @@ class SamplerBase(object):
     """
     Keywords are passed to make_dataset
     """
-    return self._make_dataset(self.train_df, **kw)
+    return self._make_dataset(self.raw_train_data, **kw)
 
   def new_sampler_from_val_ds(self, **kw):
     """
     Keywords are passed to make_dataset
     """
-    return self._make_dataset(self.val_df, **kw)
+    return self._make_dataset(self.raw_val_data, **kw)
 
   def new_sampler_from_test_ds(self, **kw):
     """
     Keywords are passed to make_dataset
     """
-    return self._make_dataset(self.test_df, **kw)
+    return self._make_dataset(self.raw_test_data, **kw)
 
   @property
   def has_train_ds(self):
-    raise NotImplementedError("has_train_ds is not implemented")
+    return hasattr(self,"raw_train_data")
 
   @property
   def has_val_ds(self):
-    raise NotImplementedError("has_val_ds is not implemented")
+    return hasattr(self,"raw_val_data")
 
   @property
   def has_test_ds(self):
-    raise NotImplementedError("has_test_ds is not implemented")
+    return hasattr(self,"raw_test_data")
+ 
+  @abstractmethod
+  def _make_dataset( self, df, opts, cache_filepath):
+    pass
+
+  @abstractmethod
+  def _split_data(self, val_frac, test_frac ):
+    pass
 
   @_CacheStorage.cached_property()
   def training_sampler(self):
@@ -119,8 +133,12 @@ class SamplerBase(object):
     Sampler on the same conditions as those specified for class instance
     """
     cache_filepath = self._cache_filepath
-    if cache_filepath: cache_filepath += '_train_surrogate'
-    return self._make_dataset(self.train_df, self.training_sampler_opts, cache_filepath )
+    label = 'train_surrogate'
+    if cache_filepath: cache_filepath += '_' + label
+    ds = self._make_dataset(self.raw_train_data, self.training_sampler_opts, cache_filepath )
+    ds.label = label
+    ds.opts = self.training_sampler_opts
+    return ds
 
   @_CacheStorage.cached_property()
   def evaluation_sampler_from_train_ds(self):
@@ -128,8 +146,12 @@ class SamplerBase(object):
     Sampler on the same conditions as those specified for class instance
     """
     cache_filepath = self._cache_filepath
-    if cache_filepath: cache_filepath += '_train_perf'
-    return self._make_dataset(self.train_df, self.eval_sampler_opts, cache_filepath)
+    label = 'train_perf'
+    if cache_filepath: cache_filepath += '_' + label
+    ds = self._make_dataset(self.raw_train_data, self.eval_sampler_opts, cache_filepath )
+    ds.label = label
+    ds.opts = self.eval_sampler_opts
+    return ds
 
   @_CacheStorage.cached_property()
   def evaluation_sampler_from_val_ds(self):
@@ -137,8 +159,12 @@ class SamplerBase(object):
     Sampler on the same conditions as those specified for class instance
     """
     cache_filepath = self._cache_filepath
-    if cache_filepath: cache_filepath += '_val_perf'
-    return self._make_dataset(self.val_df, self.eval_sampler_opts, cache_filepath, memory_cache = True)
+    label = 'val_perf'
+    if cache_filepath: cache_filepath += '_' + label
+    ds = self._make_dataset(self.raw_val_data, self.eval_sampler_opts, cache_filepath )
+    ds.label = label
+    ds.opts = self.eval_sampler_opts
+    return ds
 
   @_CacheStorage.cached_property()
   def evaluation_sampler_from_test_ds(self):
@@ -146,8 +172,12 @@ class SamplerBase(object):
     Sampler on the same conditions as those specified for class instance
     """
     cache_filepath = self._cache_filepath
-    if cache_filepath: cache_filepath += '_test_perf'
-    return self._make_dataset(self.test_df, self.eval_sampler_opts, cache_filepath)
+    label = 'test_perf'
+    if cache_filepath: cache_filepath += '_' + label
+    ds = self._make_dataset(self.raw_test_data, self.eval_sampler_opts, cache_filepath )
+    ds.label = label
+    ds.opts = self.eval_sampler_opts
+    return ds
 
   def batch_subsample(self, n_samples = 1, mode = "first_n", ds = "val"):
     """
@@ -253,9 +283,10 @@ class SamplerBase(object):
     eval_opts.batch_size = None
     eval_opts.take_n = None
     eval_opts.shuffle = True
+    eval_opts.shuffle_kwargs = dict( buffer_size = self.eval_sampler_opts.batch_size*8 )
     eval_opts.cache = False
     cache_filepath = ''
-    return iter(self._make_dataset(self.train_df,eval_opts,cache_filepath))
+    return iter(self._make_dataset(self.raw_train_data,eval_opts,cache_filepath))
 
   @_CacheStorage.cached_property()
   def _single_sample_cached_val_iter(self):
@@ -263,9 +294,10 @@ class SamplerBase(object):
     eval_opts.batch_size = None
     eval_opts.take_n = None
     eval_opts.shuffle = True
+    eval_opts.shuffle_kwargs = dict( buffer_size = self.eval_sampler_opts.batch_size*8 )
     eval_opts.cache = False
     cache_filepath = ''
-    return iter(self._make_dataset(self.val_df,eval_opts,cache_filepath))
+    return iter(self._make_dataset(self.raw_val_data,eval_opts,cache_filepath))
 
   @_CacheStorage.cached_property()
   def _single_sample_cached_test_iter(self):
@@ -273,13 +305,7 @@ class SamplerBase(object):
     eval_opts.batch_size = None
     eval_opts.take_n = None
     eval_opts.shuffle = True
+    eval_opts.shuffle_kwargs = dict( buffer_size = self.eval_sampler_opts.batch_size*8 )
     eval_opts.cache = False
     cache_filepath = ''
-    return iter(self._make_dataset(self.test_df,eval_opts,cache_filepath))
-
-  def _make_dataset( self, df, opts, cache_filepath):
-    raise NotImplementedError("Overload _make_dataset for class %s", self.__class__.__name__)
-
-  def _split_data(self, df, val_frac, test_frac ):
-    # TODO Add compatibility with k-fold or bootstapping 
-    raise NotImplementedError("Overload _split_data for class %s", self.__class__.__name__)
+    return iter(self._make_dataset(self.raw_test_data,eval_opts,cache_filepath))

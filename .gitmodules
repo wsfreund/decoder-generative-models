@@ -1,0 +1,3 @@
+[submodule "eff_meter/ais"]
+	path = eff_meter/ais_base
+	url = https://github.com/wsfreund/ais

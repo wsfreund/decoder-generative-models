@@ -20,8 +20,6 @@ class Wasserstein_GAN(DecoderGenerator):
     self._use_lipschitz_penalty = retrieve_kw(kw, 'use_gradient_penalty', True                                                      )
     self._grad_weight          = tf.constant( retrieve_kw(kw, 'grad_weight',          10.0                                        ) )
     self._surrogate_lkeys |= {"lipschitz", "wasserstein"}
-    self._train_perf_lkeys |= set(["wasserstein",]) if [m for m in self._train_perf_meters if isinstance(m, CriticEffMeter)] else set()
-    self._val_perf_lkeys |= set(["wasserstein",]) if [m for m in self._val_perf_meters if isinstance(m, CriticEffMeter)] else set()
 
   def latent_dim(self):
     return self._latent_dim
@@ -48,11 +46,12 @@ class Wasserstein_GAN(DecoderGenerator):
 
   @tf.function
   def generate(self, n_samples, **call_kw):
-    return self.transform( self.sample_generator_input( n_samples ),**call_kw)
+    return self.transform( self.sample_generator_input( n_samples = tf.cast( n_samples, dtype=tf.int32 ) ),**call_kw)
 
   @tf.function
   def _compute_u_hat(self, x, x_hat):
-    epsilon = tf.random.uniform((x.shape[0], 1, 1), 0.0, 1.0)
+    x_shape = tf.concat([x.shape[:1],tf.ones_like(x.shape[1:],dtype=tf.int32)],axis=0)
+    epsilon = tf.random.uniform(x_shape, 0.0, 1.0)
     u_hat = epsilon * x + (1 - epsilon) * x_hat
     return u_hat
 
@@ -79,22 +78,18 @@ class Wasserstein_GAN(DecoderGenerator):
 
   def _apply_critic_update( self, critic_tape, critic_loss ):
     critic_grads = critic_tape.gradient(critic_loss, self.critic.trainable_variables)
-    if self._use_grad_clipping:
-      critic_grads = [self._grad_clipping_fcn(g) for g in critic_grads if g is not None]
     self._critic_opt.apply_gradients(zip(critic_grads, self.critic.trainable_variables))
     return
 
   def _apply_gen_update( self, gen_tape, gen_loss):
     gen_grads = gen_tape.gradient(gen_loss, self.generator.trainable_variables)
-    if self._use_grad_clipping:
-      gen_grads = [self._grad_clipping_fcn(g) for g in gen_grads if g is not None]
     self._gen_opt.apply_gradients(zip(gen_grads, self.generator.trainable_variables))
     return
 
   @tf.function
-  def _train_step(self, samples, fake_cond_samp = None, critic_only = False):
+  def _train_step(self, samples, critic_only = False):
     with tf.GradientTape() as gen_tape, tf.GradientTape() as critic_tape:
-      gen_samples = self.generate( self.data_sampler._batch_size, **self._training_kw )
+      gen_samples = self.generate( samples.shape[0], **self._training_kw )
       data_output = self.critic(samples, **self._training_kw)
       gen_output = self.critic(gen_samples, **self._training_kw)
       lipschitz = self._lipschitz_penalty(samples, gen_samples) if self._use_lipschitz_penalty else tf.constant(0.)

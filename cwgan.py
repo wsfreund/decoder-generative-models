@@ -47,13 +47,6 @@ class cWasserstein_GAN(cDecoderGenerator, Wasserstein_GAN):
     return data[0]
 
   @tf.function
-  def _compute_u_hat(self, x, x_hat):
-    x_shape = tf.concat([x.shape[:1],tf.ones_like(x.shape[1:],dtype=tf.int32)],axis=0)
-    epsilon = tf.random.uniform(x_shape, 0.0, 1.0)
-    u_hat = epsilon * x + (1 - epsilon) * x_hat
-    return u_hat
-
-  @tf.function
   def _lipschitz_penalty(self, x, x_hat, lipschitz_conditioning):
     u_hat = self._compute_u_hat(x, x_hat)
     with tf.GradientTape() as penalty_tape:

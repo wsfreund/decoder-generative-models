@@ -4,26 +4,35 @@ import datetime
 
 class EffMeterBase(ABC):
 
-  def __init__(self, name):
+  def __init__(self, name, data_parser = lambda x: x):
     self.name = name
     self._initialized = False
     self._deltatime = datetime.timedelta()
+    self._step_deltatime = datetime.timedelta()
+    self._prev_step_deltatime = datetime.timedelta()
+    self._total_running_time = datetime.timedelta()
+    self.data_parser = data_parser
+    self.data_batch_counter = 0
+    self._locked_data_statistics = False
+
+  def update_on_data_batch(self, data, mask = None):
+    if self._locked_data_statistics:
+      return
+    self.start
+    self.update_on_parsed_data(self.data_parser(data), mask)
+    self.data_batch_counter += 1
+    self.stop
+
+  @abstractmethod
+  def update_on_parsed_data(self, data, mask):
+    pass
 
   @abstractmethod
   def retrieve(self):
     pass
 
-  @abstractmethod
-  def to_summary(self):
+  def initialize(self, wrapper):
     pass
-
-  @property
-  def initialized(self):
-    return self._initialized
-
-  @initialized.setter
-  def initialized(self, val):
-    self._initialized = val
 
   @property
   def start(self):
@@ -31,54 +40,49 @@ class EffMeterBase(ABC):
 
   @property
   def stop(self):
-    self._deltatime +=  datetime.datetime.now() - self._ctime
+    self._deltatime = datetime.datetime.now() - self._ctime
+    self._step_deltatime += self._deltatime
+    self._total_running_time += self._deltatime
 
   def reset(self):
-    self._deltatime = datetime.timedelta()
+    self._prev_step_deltatime = self._step_deltatime
+    self._step_deltatime = datetime.timedelta()
+    if not self._locked_data_statistics:
+      self.data_batch_counter = 0
 
   @property
   def print(self):
-    print("%s computation time: %s" % (self.name, self._deltatime))
+    print("%s last delta time: %s" % (self.name, self._deltatime))
+    print("%s epoch delta time: %s" % (self.name, self._step_deltatime))
+    print("%s total computation time: %s" % (self.name, self._total_running_time))
 
 class GenerativeEffMeter(EffMeterBase):
 
-  @abstractmethod
-  def initialize(self, x_data, x_mask ):
-    pass
+  def __init__(self, name, data_parser = lambda x: x, gen_parser = lambda x: x):
+    super().__init__(name, data_parser)
+    self.gen_parser = gen_parser
+    self.gen_batch_counter = 0
+    self._locked_gen_statistics = False
+
+  def initialize(self, wrapper):
+    self.data_parser = lambda x: wrapper._transform_to_meter_input(x)
+    self.gen_parser = lambda x: wrapper._transform_to_meter_input(x)
+    super().initialize(wrapper)
+
+  def update_on_gen_batch(self, data, mask = None):
+    if self._locked_gen_statistics:
+      return
+    self.start
+    self.update_on_parsed_gen(self.gen_parser(data), mask)
+    self.gen_batch_counter += 1
+    self.stop
 
   @abstractmethod
-  def accumulate(self, x_gen, x_mask ):
+  def update_on_parsed_gen(self, data, mask = None):
     pass
 
-class ModelEffMeter(EffMeterBase):
+  def reset(self):
+    super().reset()
+    if not self._locked_gen_statistics:
+      self.gen_batch_counter = 0
 
-  def __init__(self, name, model = None):
-    super().__init__(name)
-    self.model = model
-
-  @property
-  def initialized(self):
-    return self._initialized if self.model else False
-
-  @initialized.setter
-  def initialized(self, val):
-    if val == True and self.model is None:
-      raise RuntimeError("Attempted to initialize meter without a model!")
-    self._initialized = val
-
-class ScalarEff(object):
-  def to_summary(self):
-    eff = self.retrieve()
-    tf.summary.scalar(self.name, eff)
-
-class HistogramEff(object):
-  def to_summary(self):
-    hist = self.retrieve()
-    tf.summary.histogram(self.name, hist)
-
-class ScalaAndHistogramEff(object):
-  def to_summary(self):
-    eff, hist = self.retrieve()
-    # FIXME
-    tf.summary.scalar(self.name, eff)
-    tf.summary.histogram(self.name, hist)

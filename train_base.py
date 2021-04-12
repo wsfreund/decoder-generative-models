@@ -434,7 +434,7 @@ class TrainBase(MaskModel):
                   meters = self._train_perf_meters, lc = lc
               )
               train_perf_dict['step'] = lc.step
-              self._handle_new_loss_step(lc.train_perf_record, train_perf_dict, write_to_summary = writer is not None)
+              self._handle_new_loss_step(lc.train_perf_record, train_perf_dict )
             self._update_writer_file(self._train_perf_summary_writer)
             with self._val_perf_summary_writer.as_default(step = lc.step) as writer:
               val_perf_dict = self.performance_measure_fcn( 
@@ -442,7 +442,7 @@ class TrainBase(MaskModel):
                   meters = self._val_perf_meters, lc = lc
               )
               val_perf_dict['step'] = lc.step
-              self._handle_new_loss_step(lc.val_perf_record, val_perf_dict, write_to_summary = writer is not None)
+              self._handle_new_loss_step(lc.val_perf_record, val_perf_dict )
             self._update_writer_file(self._val_perf_summary_writer)
           if bool(self.early_stopping_key): 
             if ( lc.step == lc.best_step or val_perf_dict[self.early_stopping_key] < lc.best_val_reco ):

@@ -156,8 +156,10 @@ class DecoderGenerator(TrainBase):
       return card
     if self._n_latent_performance_samples == "performance_ds_cardinality":
       card_train = get_cardinality(self.data_sampler.evaluation_sampler_from_train_ds)
+      card_train *= self.data_sampler.eval_sampler_opts.batch_size
       print("Train dataset cardinality is %s." % card_train)
       card_val = get_cardinality(self.data_sampler.evaluation_sampler_from_val_ds)
+      card_val *= self.data_sampler.eval_sampler_opts.batch_size
       print("Validation dataset cardinality is %s." % card_val)
       card = max(card_train, card_val)
       take_n = card

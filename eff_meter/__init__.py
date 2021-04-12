@@ -1,6 +1,5 @@
 from .meter_base import *
 from .acf import ACFMeter, ACFBufferedMeter
-from .buffered_acf import ACFBufferedMeter_SingleBatch
 from .ais import AISMeter
 from .cacf import CACFMeter
 from .epdf import ePDFMeter, ePDFBufferedMeter

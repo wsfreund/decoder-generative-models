@@ -204,7 +204,7 @@ class TrainBase(MaskModel):
       lc.best_epoch = lc.best_step = lc.last_progress_step = 0; lc.best_val_reco = np.finfo( dtype = np.float32 ).max
       lc.p_sample_period = -np.inf; lc._history_cur_batch_samples = 0;
       lc.step = lc.epoch = 0
-      lc.prev_train_time = 0
+      lc.prev_train_time = datetime.timedelta()
       lc.total_performance_measure_time = datetime.timedelta()
     last_print_cycle = -1; last_save_cycle = 0
     skipFinalPerfEval = is_new_print_cycle = False;
@@ -476,6 +476,12 @@ class TrainBase(MaskModel):
     self.save( save_models_and_optimizers = False
              , loss_data = loss_data)
     return loss_data
+
+  def get_batch_size_from_data(self,data):
+    return data.shape[0]
+
+  def get_non_batch_dimension_size_from_data(self,data):
+    return data.shape[1:]
 
   def build_models(self):
     raise NotImplementedError("Overload this method returning a dict with the models to be used.")
@@ -770,7 +776,7 @@ class TrainBase(MaskModel):
     except:
       perc_steps = 0
     try:
-      perc_wall = np.around(100*lc.session_train_time/self._max_train_wall_time, decimals=1)
+      perc_wall = np.around(100*session_train_time/self._max_train_wall_time, decimals=1)
     except:
       perc_wall = 0
     perc = max(perc_epoches, perc_steps, perc_wall)

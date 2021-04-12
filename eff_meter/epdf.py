@@ -1,4 +1,4 @@
-from .meter_base import GenerativeEffMeter
+from .meter_base import GenerativeEffMeter, GenerativeEffBufferedMeter
 from ..misc import *
 
 import tensorflow as tf
@@ -8,27 +8,24 @@ import itertools
 class ePDFMeter(GenerativeEffMeter):
 
   def __init__(self, range_value, name = "ePDF", data_parser = lambda x: x
-              , gen_parser = lambda x: x, nbins = 50):
-    super().__init__(name, data_parser, gen_parser)
+              , gen_parser = lambda x: x, nbins = 50, **kw):
+    super().__init__(name = name, data_parser = data_parser, gen_parser = gen_parser, **kw)
     if not isinstance(range_value, np.ndarray):
       range_value = np.ndarray(range_value)
     self.range_value = range_value
     self.nbins = nbins
-    self.xs = None
-    self.dfR = None
-    self.dfG = None
+    self.xs = self.range_value.shape[:-1]
+    self.dfR = np.ndarray(self.xs, dtype=np.object)
+    self.dfG = np.ndarray(self.xs, dtype=np.object)
 
   def update_on_parsed_data(self, data, mask):
     if mask is not None:
       raise NotImplementedError("%s is not currently implemented for masked data" % self.__class__.__name__)
-    if self.xs is None:
-      self.xs = data.shape
-      self.dfR = np.ndarray(self.xs[1:], dtype=np.object)
-      self.dfG = np.ndarray(self.xs[1:], dtype=np.object)
-    for indexes in itertools.product(*map(range,self.xs[1:])):
-      dfR, _ = np.histogram(data[(slice(None),)+indexes].numpy(), bins=self.nbins, density=True, range=self.range_value[indexes])
+    if not isinstance(data, np.ndarray):
+      data = data.numpy()
+    for indexes in itertools.product(*map(range,self.xs)):
+      dfR = np.histogram(data[(slice(None),)+indexes], bins=self.nbins, density=True, range=self.range_value[indexes])[0]
       if self.dfR[indexes] is not None:
-        # TODO Check dfR update
         self.dfR[indexes] += dfR
       else:
         self.dfR[indexes] = dfR
@@ -36,8 +33,10 @@ class ePDFMeter(GenerativeEffMeter):
   def update_on_parsed_gen(self, data, mask = None ):
     if mask is not None:
       raise NotImplementedError("%s is not currently implemented for masked data" % self.__class__.__name__)
-    for indexes in itertools.product(*map(range,self.xs[1:])):
-      dfG, _ = np.histogram(data[(slice(None),)+indexes].numpy(), bins=self.nbins, density=True, range=self.range_value[indexes])
+    if not isinstance(data, np.ndarray):
+      data = data.numpy()
+    for indexes in itertools.product(*map(range,self.xs)):
+      dfG = np.histogram(data[(slice(None),)+indexes], bins=self.nbins, density=True, range=self.range_value[indexes])[0]
       if self.dfG[indexes] is not None:
         self.dfG[indexes] += dfG
       else:
@@ -62,4 +61,11 @@ class ePDFMeter(GenerativeEffMeter):
 
   def reset(self):
     super().reset()
-    self.dfG = np.ndarray(self.xs[1:], dtype=np.object)
+    self.dfG = np.ndarray(self.xs, dtype=np.object)
+
+class ePDFBufferedMeter(ePDFMeter, GenerativeEffBufferedMeter):
+
+  def __init__( self, range_value, name = "ePDF", data_parser = lambda x: x, gen_parser = lambda x: x, nbins = 50
+              , data_buffer = None, gen_buffer = None, max_buffer_size = 16, **kw):
+    super().__init__( range_value = range_value, name = name, data_parser = data_parser, gen_parser = gen_parser, nbins = nbins
+                    , data_buffer = data_buffer, gen_buffer = gen_buffer, max_buffer_size = max_buffer_size, **kw)

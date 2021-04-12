@@ -23,14 +23,22 @@ class cDecoderGenerator(DecoderGenerator):
     self.use_same_real_fake_conditioning = retrieve_kw(kw, 'use_same_real_fake_conditioning',  True )
     if self.use_same_real_fake_conditioning is False:
       raise NotImplementedError("use_same_real_fake_conditioning must be set to True.")
-    # This must be specified to allow comparing real with fake samples on
-    # the "self.generate" function and to sample when using
-    # use_same_real_fake_conditioning
-    self.extract_generator_input_from_standard_batch_fcn = retrieve_kw(kw, 'extract_generator_input_from_standard_batch_fcn', None )
     # Supposed to sample all info except the latent space
     self.generator_sampler = retrieve_kw(kw, 'generator_sampler',  None  )
 
   def sample_generator_input(self, sampled_input = None, latent_data = None, n_samples = None, ds = None):
+    """
+    Sample condition and latent data.
+    - sampled_input: extract condition from sampled_input. To be used when
+      generator input should be aligned with the data conditions
+    - latent_data: specify the latent data to be used. If n_samples is
+      specified and latent_data is larger than it, use first latent samples.
+    - n_samples: If sampled input and latent_data is not specified, sample 
+      this number of samples from the condition and latent datasets and
+      return them.
+    - ds: dataset from which to sample the conditions from when sampled_input
+      is not specified.
+    """
     if self.use_same_real_fake_conditioning:
       sampler = self.data_sampler
     else:
@@ -56,26 +64,54 @@ class cDecoderGenerator(DecoderGenerator):
           sampled_input = safe_sampler("_cached_test_sampler", sampler.evaluation_sampler_from_test_ds)
       else:
         sampled_input = sampler.sample( n_samples = n_samples, ds = ds )
-    if self.use_same_real_fake_conditioning:
-      if self.extract_generator_input_from_standard_batch_fcn is None:
-        raise NotImplementedError(
-            """Please specify extract_generator_input_from_standard_batch_fcn
-            with a method capable of extracting all required information from
-            regular batch except for the latent states."""
-        )
-      sampled_input = self.extract_generator_input_from_standard_batch_fcn( sampled_input )
-    if not isinstance(sampled_input, list):
-      sampled_input = [sampled_input]
+    condition = to_tuple(self.extract_condition_from_generator_input( sampled_input ))
     if n_samples is None:
-      n_samples = sampled_input[0].shape[0]
+      n_samples = condition[0].shape[0]
+    else:
+      condition_bs = condition[0].shape[0]
+      if n_samples < condition_bs:
+        condition = [c[:n_samples,...] for c in condition]
+      else:
+        if n_samples % condition_bs:
+          raise NotImplementedError("Cannot use non-batch-multiple value for n_samples.")
+        tile_multiples = [n_samples // condition_bs] + [1]*condition[0].shape[1:].rank
+        condition = [tf.tile(c,tile_multiples) for c in condition]
     if latent_data is None:
       latent_data = self.sample_latent( n_samples )
     else:
-      if latent_data.shape[0] != n_samples:
-        raise ValueError("latent_data size differs from number of samples")
-    generator_input = sampled_input + [ latent_data ]
+      latent_data = latent_data[:n_samples,...]
+    generator_input = self.build_generator_input(condition, latent_data)
     generator_input = self._ensure_batch_size_dim(self.generator, generator_input)
     return generator_input
+
+  def get_batch_size_from_data(self,data):
+    return data[0].shape[0]
+
+  def get_non_batch_dimension_size_from_data(self,data):
+    return data[0].shape[1:]
+
+  def extract_condition_from_data(self, data ):
+    return data[:-1]
+
+  def extract_target_space_from_data(self, data ):
+    return data[-1]
+
+  def build_input(self, condition, data):
+    condition = to_tuple(condition)
+    data = to_tuple(data)
+    return condition + data
+
+  def extract_condition_from_generator_input(self, data ):
+    # Assume that condition on generator input has the same position as in data
+    return self.extract_condition_from_data( data )
+
+  def extract_latent_from_generator_input(self, data ):
+    return data[-1]
+
+  def build_generator_input(self, condition, latent):
+    condition = to_tuple(condition)
+    latent = to_tuple(latent)
+    return condition + latent
 
   def _ensure_batch_size_dim(self, model, inputs):
     gm_len = len(model.input[0].shape)

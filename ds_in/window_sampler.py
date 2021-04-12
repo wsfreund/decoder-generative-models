@@ -10,10 +10,17 @@ from .data_manager import TimeseriesMetadata
 
 class SpecificFlowWindowSamplingOpts(SpecificFlowSamplingOpts):
   """
-  Allows to specify different sampling options for the same dataset
+  Allows to specify different sampling options for each sampling type
   """
+
+  def __init__( self, sequence_stride = NotSet, **kw ):
+    self.sequence_stride = sequence_stride
+    super().__init__(**kw)
+
   def set_unset_to_default(self, sampler, df):
     super().set_unset_to_default( sampler, df )
+    if self.sequence_stride is NotSet:
+      self.sequence_stride =  sampler._default_sequence_stride
     if not "buffer_size" in self.shuffle_kwargs:
       if sampler.shuffle_buffer_size_window is NotSet:
         shuffle_buffer_size_window = datetime.timedelta(days=TimeseriesMetadata.days_per_year)
@@ -22,7 +29,7 @@ class SpecificFlowWindowSamplingOpts(SpecificFlowSamplingOpts):
         shuffle_buffer_size_window = sampler.shuffle_buffer_size_window
       # Compute the buffer size
       val = int(np.round( shuffle_buffer_size_window
-                        / (sampler._sequence_stride*sampler._time_step)
+                        / (self.sequence_stride*sampler._time_step)
                ))
       # Increase buffer size when sampling from marginals
       if sampler._sample_from_marginals:
@@ -48,12 +55,15 @@ class WindowSampler(SamplerBase):
     self.shuffle_buffer_size_window = retrieve_kw(kw, "shuffle_buffer_size_window" )
     self._sample_from_marginals     = retrieve_kw(kw, "sample_from_marginals",      False                                )
     self._keep_marginal_axis        = retrieve_kw(kw, "keep_marginal_axis",         True                                 )
-    self._sequence_stride           = retrieve_kw(kw, "sequence_stride",            1                                    )
+    self._default_sequence_stride   = retrieve_kw(kw, "default_sequence_stride",    1                                    )
     self._past_widths_wrt_present   = retrieve_kw(kw, "past_widths_wrt_present",    True                                 )
     self._overlaps                  = retrieve_kw(kw, "overlaps",                   None                                 )
     features                        = retrieve_kw(kw, "features",                   []                                   )
     past_widths                     = retrieve_kw(kw, "past_widths",                None                                 )
     n_cycles                        = retrieve_kw(kw, "n_cycles",                   1                                    )
+    # backward compatibility
+    if "sequence_stride" in kw:
+      self._default_sequence_stride   = kw["sequence_stride"]
     del kw
 
     # Strip information from dataset
@@ -212,11 +222,11 @@ class WindowSampler(SamplerBase):
         data=data,
         targets=None,
         sequence_length=self.total_window_size,
-        sequence_stride=self._sequence_stride,
+        sequence_stride=opts.sequence_stride,
         shuffle=False,
         batch_size=tf.constant(1,dtype=tf.int64),)
     if cache_filepath: cache_filepath += '_win%d' % self.total_window_size
-    if cache_filepath: cache_filepath += '_stride%d' % self._sequence_stride
+    if cache_filepath: cache_filepath += '_stride%d' % opts.sequence_stride
     # XXX Hack to remove batching
     ds = ds._input_dataset
     # Cache just after the heavy windowing operation so that it is shared

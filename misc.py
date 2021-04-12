@@ -71,6 +71,13 @@ def mkdir_p(path):
   if not os.path.exists( path ):
     os.makedirs(path)
 
+def to_tuple(i):
+  if not isinstance(i, tuple):
+    if type(i) is list:
+      return tuple(i)
+    else:
+      return (i,)
+  return i
 
 import signal
 import logging

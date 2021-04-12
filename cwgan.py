@@ -81,10 +81,8 @@ class cWasserstein_GAN(cDecoderGenerator, Wasserstein_GAN):
                                              ,self.extract_critic_conditioning(gen_batch))]
     data_inputs = tf.concat([tf.gather(self.extract_critic_input(data_batch), data_idxs)
                             ,tf.gather(self.extract_critic_input(gen_batch), gen_idxs)], axis = 0)
-    sampled_input = tf.gather( self.extract_generator_input_from_standard_batch_fcn(data_batch), data_idxs) 
-    if not isinstance(sampled_input, list):
-      sampled_input = [sampled_input]
-    generator_inpput = sampled_input + [self.sample_latent( self.data_sampler._batch_size//2 ) ]
+    condition = tf.gather( self.extract_condition_from_data(data_batch), data_idxs) 
+    generator_inpput = self.build_generator_input(condition, self.sample_latent( self.data_sampler._batch_size//2 ) )
     gen_inputs = tf.concat([self.transform( generator_input, **self._training_kw )
                             ,tf.gather(self.extract_critic_input(gen_batch), gen_idxs)], axis = 0)
     return data_inputs, gen_inputs, lipschitz_conditioning

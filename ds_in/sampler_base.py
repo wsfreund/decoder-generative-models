@@ -140,6 +140,16 @@ class SamplerBase(ABC):
     ds.opts = self.training_sampler_opts
     return ds
 
+  def evaluation_sampler_from_ds(self, ds):
+    if ds == "train":
+      return self.evaluation_sampler_from_train_ds()
+    elif ds == "val":
+      return self.evaluation_sampler_from_val_ds()
+    elif ds == "test":
+      return self.evaluation_sampler_from_test_ds()
+    else:
+      raise RuntimeError("Unspecified dataset label %s" % ds)
+
   @_CacheStorage.cached_property()
   def evaluation_sampler_from_train_ds(self):
     """

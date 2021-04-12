@@ -30,7 +30,7 @@ class CriticEffMeter(GenerativeEffMeter):
     self.avg_output_gen /= self.gen_batch_counter
     return { self.name + '_data' : self.avg_output_data
            , self.name + '_gen' : self.avg_output_gen
-           , self.name + '_delta' : self.avg_output_gen - self.avg_output_data}
+           , self.name + '_delta' : self.avg_output_data - self.avg_output_gen }
 
   def reset(self):
     super().reset()

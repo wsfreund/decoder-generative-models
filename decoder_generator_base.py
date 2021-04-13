@@ -3,6 +3,7 @@ import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
 import contextlib
+from tqdm import tqdm
 
 try:
   from misc import *
@@ -19,7 +20,6 @@ class DecoderGenerator(TrainBase):
       self._required_models = {"generator", "critic",}
     else:
       self._required_models |= {"generator", "critic",}
-    # TODO Set default optimizer to adam with zero momentum!
     self._n_critic                  = retrieve_kw(kw, 'n_critic',                 0                            )
     self._result_file               = retrieve_kw(kw, 'result_file',              "weights.decoder_generator"  )
     self._latent_dim                = tf.constant( retrieve_kw(kw, 'latent_dim',  100                          ), dtype = tf.int32      )
@@ -41,17 +41,15 @@ class DecoderGenerator(TrainBase):
   def performance_measure_fcn(self, sampler_ds, meters, lc):
     ret = {}
     # Loop over data samples
-    for i, sample_batch in enumerate(sampler_ds):
+    for i, sample_batch in tqdm(enumerate(sampler_ds),desc='Performance measurement on data'):
       sample_batch = self.sample_parser_fcn( sample_batch )
-      # TODO If needed, sample multiple batches per sample batch
       for meter in meters:
         meter.update_on_data_batch( sample_batch )
     # Loop over transported latent samples
     sample_iter = iter(sampler_ds)
-    for latent_data in self._latent_sampler_performance_ds:
+    for latent_data in tqdm(self._latent_sampler_performance_ds,desc='Performance measurement on generated samples'):
       sample_batch, sample_iter = self._secure_sample(sample_iter,sampler_ds)
       sample_batch = self.sample_parser_fcn( sample_batch )
-      # FIXME This implementation can be improved
       # Retrieve generator equivalent data
       generator_batch = self.sample_generator_input(
             sampled_input = sample_batch
@@ -61,7 +59,7 @@ class DecoderGenerator(TrainBase):
       for meter in filter(lambda m: isinstance(m, GenerativeEffMeter),meters):
         meter.update_on_gen_batch( gen_batch )
     # Retrieve results
-    for meter in meters:
+    for meter in  tqdm(meters,desc='Retrieving efficiency measurements'):
       ret.update(meter.retrieve())
       meter.reset()
     return ret

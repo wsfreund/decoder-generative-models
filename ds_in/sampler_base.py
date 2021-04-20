@@ -216,20 +216,25 @@ class SamplerBase(ABC):
       f_iter = fget.__get__(self, type(self))()
       samples = next(f_iter)
     if mode == "first_n":
-      if isinstance(samples, dict):
-        ret_samples = {}
-        for k, v in samples.items():
-          if isinstance(v,(tuple,list)):
-            ret_samples[k] = [v2[:n_samples] for v2 in v]
-          else:
-            ret_samples[k] = v[:n_samples]
-        return ret_samples
-      elif isinstance(samples,(tuple,list)):
-        return [v[:n_samples] for v in samples]
-      else:
-        return samples[:n_samples]
+      return self.subsample(samples, slice(n_samples))
     else:
       raise ValueError("invalid mode '%s'" % mode)
+
+  def subsample(self, data, data_slice):
+    if isinstance(data, dict):
+      return {k : self.subsample(v, data_slice) for k, v in data.items()}
+    elif isinstance(data,(tuple,list)):
+      return [self.subsample(v,data_slice) for v in data]
+    else:
+      return data[data_slice]
+
+  def select_samples(self, data, sample_mask):
+    if isinstance(data, dict):
+      return {k : self.select_samples(v, sample_mask) for k, v in data.items()}
+    elif isinstance(data,(tuple,list)):
+      return [self.select_samples(v,sample_mask) for v in data]
+    else:
+      return data[sample_mask]
 
   def sample(self, n_samples = 1, ds = "val"):
     """

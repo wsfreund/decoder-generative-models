@@ -4,6 +4,7 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 import contextlib
 from tqdm import tqdm
+from math import ceil
 
 try:
   from misc import *
@@ -22,7 +23,7 @@ class DecoderGenerator(TrainBase):
       self._required_models |= {"generator", "critic",}
     self._n_critic                  = retrieve_kw(kw, 'n_critic',                 0                            )
     self._result_file               = retrieve_kw(kw, 'result_file',              "weights.decoder_generator"  )
-    self._latent_dim                = tf.constant( retrieve_kw(kw, 'latent_dim',  100                          ), dtype = tf.int32      )
+    self._latent_dim                = retrieve_kw(kw, 'latent_dim',               100                          )
     self._transform_to_meter_input  = retrieve_kw(kw, 'transform_to_meter_input', lambda x: x                  )
     self._n_pretrain_critic         = retrieve_kw(kw, 'n_pretrain_critic',        None                         )
     self._cache_performance_latent  = retrieve_kw(kw, 'cache_performance_latent', True                         )
@@ -38,30 +39,36 @@ class DecoderGenerator(TrainBase):
     self._cached_filepath_dict = {}
     self._decorate_latent_sampler()
 
-  def performance_measure_fcn(self, sampler_ds, meters, lc):
+  def performance_measure_fcn(self, sampler_ds, meters):
     ret = {}
-    # Loop over data samples
-    for i, sample_batch in tqdm(enumerate(sampler_ds),desc='Performance measurement on data'):
-      sample_batch = self.sample_parser_fcn( sample_batch )
-      for meter in meters:
-        meter.update_on_data_batch( sample_batch )
-    # Loop over transported latent samples
-    sample_iter = iter(sampler_ds)
-    for latent_data in tqdm(self._latent_sampler_performance_ds,desc='Performance measurement on generated samples'):
-      sample_batch, sample_iter = self._secure_sample(sample_iter,sampler_ds)
-      sample_batch = self.sample_parser_fcn( sample_batch )
-      # Retrieve generator equivalent data
-      generator_batch = self.sample_generator_input(
-            sampled_input = sample_batch
-          , latent_data = latent_data
-      )
-      gen_batch = self.transform( generator_batch )
-      for meter in filter(lambda m: isinstance(m, GenerativeEffMeter),meters):
-        meter.update_on_gen_batch( gen_batch )
-    # Retrieve results
-    for meter in  tqdm(meters,desc='Retrieving efficiency measurements'):
-      ret.update(meter.retrieve())
-      meter.reset()
+    if meters:
+      # Loop over data samples
+      for counter, sample_batch in tqdm( enumerate(sampler_ds)
+                                       , desc='Computing quantities on data samples'
+                                       , total=self._get_cardinality(sampler_ds) ):
+        sample_batch = self.sample_parser_fcn( sample_batch )
+        for meter in meters:
+          meter.update_on_data_batch( sample_batch )
+      self._decorate_cardinality(sampler_ds, counter+1)
+      # Loop over transported latent samples
+      sample_iter = iter(sampler_ds)
+      for counter, latent_data in tqdm( self._latent_sampler_performance_ds
+                             , desc='Computing quantities on synthetic samples'
+                             , total=self._latent_sampler_performance_ds_cardinality):
+        sample_batch, sample_iter = self._secure_sample(sample_iter,sampler_ds)
+        sample_batch = self.sample_parser_fcn( sample_batch )
+        # Retrieve generator equivalent data
+        generator_batch = self.sample_generator_input(
+              sampled_input = sample_batch
+            , latent_data = latent_data
+        )
+        gen_batch = self.transform( generator_batch )
+        for meter in filter(lambda m: isinstance(m, GenerativeEffMeter),meters):
+          meter.update_on_gen_batch( gen_batch )
+      # Retrieve results
+      for meter in  tqdm(meters,desc='Retrieving efficiency measurements'):
+        ret.update(meter.retrieve())
+        meter.reset()
     return ret
 
   def _secure_sample(self, sample_iter, sampler_ds):
@@ -82,7 +89,6 @@ class DecoderGenerator(TrainBase):
     if cache_filepath: cache_filepath += '_batch%d' % opts.batch_size
     if bool(opts.take_n): # 
       if cache_filepath: cache_filepath += '_take%d' % opts.take_n
-      from math import ceil
       ds = ds.take( int(ceil(opts.take_n / opts.batch_size)) )
     if cache_filepath:
       if cache_filepath not in self._cached_filepath_dict:
@@ -153,11 +159,13 @@ class DecoderGenerator(TrainBase):
         card += 1
       return card
     if self._n_latent_performance_samples == "performance_ds_cardinality":
-      card_train = get_cardinality(self.data_sampler.evaluation_sampler_from_train_ds)
-      card_train *= self.data_sampler.eval_sampler_opts.batch_size
+      if self._train_perf_cardinality is None:
+        self._train_perf_cardinality = get_cardinality(self.data_sampler.evaluation_sampler_from_train_ds)
+      card_train = self._train_perf_cardinality * self.data_sampler.eval_sampler_opts.batch_size
       print("Train dataset cardinality is %s." % card_train)
-      card_val = get_cardinality(self.data_sampler.evaluation_sampler_from_val_ds)
-      card_val *= self.data_sampler.eval_sampler_opts.batch_size
+      if self._val_perf_cardinality is None:
+        self._val_perf_cardinality = get_cardinality(self.data_sampler.evaluation_sampler_from_val_ds)
+      card_val = self._val_perf_cardinality * self.data_sampler.eval_sampler_opts.batch_size
       print("Validation dataset cardinality is %s." % card_val)
       card = max(card_train, card_val)
       take_n = card
@@ -168,4 +176,10 @@ class DecoderGenerator(TrainBase):
     opts.take_n = take_n
     latent_cache_path = self.data_sampler._cache_filepath + "_latent_data" if self._cache_performance_latent else ''
     self._latent_sampler_performance_ds = self.latent_sampler_ds_factory( opts, latent_cache_path )
+    self._latent_sampler_performance_ds_cardinality = self._latent_sampler_performance_ds.cardinality()
+    if self._latent_sampler_performance_ds_cardinality < 1:
+      if bool(opts.take_n): # 
+        self._latent_sampler_performance_ds_cardinality = int(ceil(opts.take_n / opts.batch_size))
+      else:
+        self._latent_sampler_performance_ds_cardinality = None
 

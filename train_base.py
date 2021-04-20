@@ -8,6 +8,7 @@ import datetime
 import contextlib
 from tensorflow.keras import layers
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 try:
   from misc import *
@@ -37,9 +38,6 @@ class TrainingCriticalAbort( BaseException ):
   pass
 
 class BreakDueToNonFinite( TrainingCriticalAbort ):
-  pass
-
-class Container(object):
   pass
 
 class TrainBase(MaskModel):
@@ -166,6 +164,8 @@ class TrainBase(MaskModel):
     assert self._surrogate_plot_yscale in ("log","linear")
     assert self._perf_plot_xscale in ("log","linear", "mix", None, NotSet)
     assert all([v in ("log","linear") for v in self._perf_plot_yscale.values()])
+    self._train_perf_cardinality = None
+    self._val_perf_cardinality = None
 
   def train(self, fine_tuning = False):
     self._check_required_models()
@@ -177,27 +177,16 @@ class TrainBase(MaskModel):
     if self._verbose: print('This machine has %i GPUs.' % n_gpus)
 
     # containers for losses
-    lc = Container(); self.lc =lc
+    lc = Container(); self.lc = lc
     if self._load_model_at_path is not None:
       # Load model
       self.load( self._load_model_at_path )
       # Load loss record
-      loss_data = self.load( self._load_model_at_path, return_loss = True)
-      lc.surrogate_loss_record  = loss_data["surrogate_loss_record"]
-      lc.train_perf_record  = loss_data["train_perf_record"]
-      lc.val_perf_record  = loss_data["val_perf_record"]
-      # Load local_keys
-      lc.__dict__.update( self.load( self._load_model_at_path, return_locals = True) )
-      if not hasattr(lc,"total_performance_measure_time"):
-        lc.total_performance_measure_time = datetime.timedelta()
-      if not hasattr(lc,"prev_train_time"):
-        lc.prev_train_time = datetime.timedelta()
-      else:
-        # Update session train time
-        lc.prev_train_time += lc.session_train_time
-      # Save a model copy with previous best validation so that if this
-      # training is useless, we can recover previous best model
-      self.save( overwrite = True, val = True )
+      self._fill_training_container( self._load_model_at_path, lc )
+      if self._load_model_at_path != self._save_model_at_path:
+        # Save a model copy with previous best validation so that if this
+        # training session is useless, we can recover previous best model
+        self.save( overwrite = True, val = True )
     else:
       lc.surrogate_loss_record = {k : [] for k in self._surrogate_lkeys}
       lc.train_perf_record = {}; lc.val_perf_record = {}
@@ -237,6 +226,7 @@ class TrainBase(MaskModel):
             # below without running self._train_base and without incrementing
             # lc.step
             if self.sample_parser_fcn is not None:
+              #self.data_sampler.plot(data_samples = sample_batch, do_display = True)
               sample_batch = self.sample_parser_fcn(sample_batch)
             #print("Running first train step")
             surrogate_loss_dict = self._train_base(lc.epoch, lc.step, sample_batch)
@@ -268,8 +258,9 @@ class TrainBase(MaskModel):
               #if lc._history_cur_batch_samples < self._history_max_batch_samples:
               train_perf_dict = self.performance_measure_fcn(
                   sampler_ds = self.data_sampler.evaluation_sampler_from_train_ds,
-                  meters = self._train_perf_meters, lc = lc)
+                  meters = self._train_perf_meters)
               train_perf_dict['step'] = lc.step
+              self.lc.last_train_perf_step = lc.step
               with self._train_perf_summary_writer.as_default(step = lc.step) as writer:
                 self._handle_new_loss_step(lc.train_perf_record, train_perf_dict)
                 for fcn in self._other_train_perf_logging_fcns:
@@ -279,8 +270,9 @@ class TrainBase(MaskModel):
                 #print("Computing val dataset performance")
                 val_perf_dict = self.performance_measure_fcn(
                     sampler_ds = self.data_sampler.evaluation_sampler_from_val_ds,
-                    meters = self._val_perf_meters, lc = lc )
+                    meters = self._val_perf_meters )
                 val_perf_dict['step'] = lc.step
+                self.lc.last_val_perf_step = lc.step
                 evaluatedPerf = True
                 with self._val_perf_summary_writer.as_default(step = lc.step) as writer:
                   # TODO Reminder handle new loss keeps track of what is plot/logged
@@ -334,8 +326,8 @@ class TrainBase(MaskModel):
                   from IPython.display import clear_output
                   clear_output(wait = True)
                 plt.close('all')
-                self._plot_surrogate_progress( lc.surrogate_loss_record )
-                self._plot_performance_progress( lc.train_perf_record, lc.val_perf_record )
+                self.plot_surrogate_progress( do_display = True )
+                self.plot_performance_progress( do_display = True )
                 for fcn in self._online_plot_fcns:
                   fcn()
               if self._verbose: 
@@ -431,7 +423,7 @@ class TrainBase(MaskModel):
             with self._train_perf_summary_writer.as_default(step = lc.step) as writer:
               train_perf_dict = self.performance_measure_fcn( 
                   sampler_ds = self.data_sampler.evaluation_sampler_from_train_ds,
-                  meters = self._train_perf_meters, lc = lc
+                  meters = self._train_perf_meters
               )
               train_perf_dict['step'] = lc.step
               self._handle_new_loss_step(lc.train_perf_record, train_perf_dict )
@@ -439,7 +431,7 @@ class TrainBase(MaskModel):
             with self._val_perf_summary_writer.as_default(step = lc.step) as writer:
               val_perf_dict = self.performance_measure_fcn( 
                   sampler_ds = self.data_sampler.evaluation_sampler_from_val_ds,
-                  meters = self._val_perf_meters, lc = lc
+                  meters = self._val_perf_meters
               )
               val_perf_dict['step'] = lc.step
               self._handle_new_loss_step(lc.val_perf_record, val_perf_dict )
@@ -460,11 +452,11 @@ class TrainBase(MaskModel):
     final_performance = {}
     final_performance['train'] = self.performance_measure_fcn(
         sampler_ds = self.data_sampler.evaluation_sampler_from_train_ds,
-        meters = self._train_perf_meters,  lc = lc )
+        meters = self._train_perf_meters )
     if self.data_sampler.has_val_ds:
       final_performance['val'] = self.performance_measure_fcn(
           sampler_ds = self.data_sampler.evaluation_sampler_from_val_ds,
-          meters = self._val_perf_meters, lc = lc )
+          meters = self._val_perf_meters )
       final_performance['val']['best_step'] = lc.best_step
       final_performance['val']['best_epoch'] = lc.best_epoch
     else:
@@ -526,20 +518,21 @@ class TrainBase(MaskModel):
   def _save_optimizer( self, key, optimizer ):
     np.savez( key, np.array(optimizer.get_weights(), dtype=np.object) )
 
-  def load(self, path, val = False, return_loss = False, return_locals = False ):
+  def load(self, path, val = False, load_opt = True, return_loss = False, return_locals = False ):
     if not self._model_io_keys:
       raise ValueError("Empty model io keys for class %s" % self.__class__.__name__)
     if not(return_locals or return_loss):
-      for ko, optimizer in self._optimizer_dict.items():
-        model = self._model_dict[ko]
-        try:
-          ko += '_opt'
-          if val: ko += '_bestval'
-          ko +=  '.npz'
-          if optimizer is not None:
-            self._load_optimizer(os.path.join(path,ko), optimizer, model)
-        except FileNotFoundError:
-          print("Warning: Could not recover %s optimizer state." % ko)
+      if load_opt:
+        for ko, optimizer in self._optimizer_dict.items():
+          model = self._model_dict[ko]
+          try:
+            ko += '_opt'
+            if val: ko += '_bestval'
+            ko +=  '.npz'
+            if optimizer is not None:
+              self._load_optimizer(os.path.join(path,ko), optimizer, model)
+          except FileNotFoundError:
+            print("Warning: Could not recover %s optimizer state." % ko)
       for k in self._model_io_keys:
         model = self._model_dict[k]
         if val: 
@@ -556,15 +549,35 @@ class TrainBase(MaskModel):
       raw_data = dict(**np.load( locals_data_path, allow_pickle=True))
       return self._treat_numpy_data( raw_data )
 
-  def performance_measure_fcn(self, sampler_ds, meters, lc):
+  def performance_measure_fcn(self, sampler_ds, meters):
     ret = {}
-    for samples in sampler_ds:
-      for meter in meters:
-        meter.update_on_data_batch( samples )
-    for meter in meters:
-      ret.update(meter.retrieve())
-      meter.reset()
+    if meters:
+      for counter, samples in tqdm( enumerate(sampler_ds)
+                                  , desc='Computing quantities on data samples'
+                                  , total = self._get_cardinality(sampler_ds) ):
+        for meter in meters:
+          meter.update_on_data_batch( samples )
+      self._decorate_cardinality(sampler_ds, counter+1)
+      for meter in  tqdm(meters,desc='Retrieving efficiency measurements'):
+        ret.update(meter.retrieve())
+        meter.reset()
     return ret
+
+  def _fill_training_container( self, path, lc ):
+    loss_data = self.load( path, return_loss = True)
+    lc.surrogate_loss_record  = loss_data["surrogate_loss_record"]
+    lc.train_perf_record  = loss_data["train_perf_record"]
+    lc.val_perf_record  = loss_data["val_perf_record"]
+    # Load local_keys
+    lc.__dict__.update( self.load( self._load_model_at_path, return_locals = True) )
+    if not hasattr(lc,"total_performance_measure_time"):
+      lc.total_performance_measure_time = datetime.timedelta()
+    if not hasattr(lc,"prev_train_time"):
+      lc.prev_train_time = datetime.timedelta()
+    else:
+      # Update session train time
+      lc.prev_train_time += lc.session_train_time
+    return lc
 
   def _create_writer( self, output_place ): 
     # XXX for surpassing colab issues
@@ -639,29 +652,42 @@ class TrainBase(MaskModel):
       raw_loss_data[k] = m.item()
     return raw_loss_data
 
-  def _plot_surrogate_progress(self, surrogate_loss_record):
+  def plot_surrogate_progress(self, do_display = False, rolling_ylim = None, ymin = None, ymax = None):
     from IPython.display import display
+    surrogate_loss_record = self.lc.surrogate_loss_record
     if not hasattr(self,"_surrogate_fig"):
       self._surrogate_fig, self._surrogate_ax = plt.subplots()
     else:
       self._surrogate_ax.cla()
     steps = np.array(surrogate_loss_record['step'])
+    if ymin is None and rolling_ylim is None:
+      rolling_ylim = True
+    if rolling_ylim:
+      ymin, ymax = float("+inf"), float("-inf")
     for k, v in surrogate_loss_record.items():
       if k == "step":
         continue
       v = np.array(v)
       idx = np.where(np.isfinite(v))[0]
       self._surrogate_ax.plot(steps[idx],v[idx],label=k)
+      if rolling_ylim:
+        lymin = np.min(v[idx[-500:]])
+        if lymin < ymin: ymin = lymin
+        lymax = np.max(v[idx[-500:]])
+        if lymax > ymax: ymax = lymax
     self._surrogate_ax.autoscale(enable=True, axis='x', tight=True)
     self._surrogate_ax.set_xlabel("#Parameter Updates")
     self._surrogate_ax.set_ylabel("Surrogate Loss")
+    if rolling_ylim or ymin is not None: self._surrogate_ax.set_ylim([ymin, ymax])
     self._surrogate_ax.legend()
     self._surrogate_ax.set_xscale(self._retrieve_xscale(self._surrogate_plot_xscale, steps[-1]))
     self._surrogate_ax.set_yscale(self._surrogate_plot_yscale)
-    display(self._surrogate_fig)
+    if do_display: display(self._surrogate_fig)
 
-  def _plot_performance_progress(self, train_perf_record, val_perf_record):
+  def plot_performance_progress(self, do_display = False):
     from IPython.display import display
+    train_perf_record = self.lc.train_perf_record
+    val_perf_record = self.lc.val_perf_record
     if not hasattr(self,"_perf_fig"):
       self._all_perf_keys = sorted(set(val_perf_record.keys()) | set(train_perf_record.keys()))
       for k in ("step",):
@@ -699,7 +725,7 @@ class TrainBase(MaskModel):
         yscale = self._perf_plot_yscale.get(k,'linear')
         ax.set_yscale(yscale)
       plt.tight_layout()
-      display(self._perf_fig)
+      if do_display: display(self._perf_fig)
 
   def _retrieve_xscale(self,val,step):
     if val in (None,NotSet,"mix"):
@@ -760,6 +786,25 @@ class TrainBase(MaskModel):
       else:
         rmtree(writer.destdir, ignore_errors=True) # this is dangerous, avoid unexpected interruptions using delayed keyboard interrupt
         copytree(writer.tempdir, writer.destdir)
+
+  def _get_cardinality(self, sampler):
+    cardinality = sampler.cardinality()
+    if cardinality == tf.data.UNKNOWN_CARDINALITY:
+      if sampler is self.data_sampler.evaluation_sampler_from_train_ds:
+        cardinality = self._train_perf_cardinality
+      elif sampler is self.data_sampler.evaluation_sampler_from_val_ds:
+        cardinality = self._val_perf_cardinality
+      else:
+        raise RuntimeError("Unknown sampler.")
+    return cardinality
+
+  def _decorate_cardinality(self, sampler, cardinality):
+    if sampler is self.data_sampler.evaluation_sampler_from_train_ds:
+      self._train_perf_cardinality = cardinality
+    elif sampler is self.data_sampler.evaluation_sampler_from_val_ds:
+      self._val_perf_cardinality = cardinality
+    else:
+      raise RuntimeError("Unknown sampler.")
 
   def _print_progress( self, epoch, session_epoch, step, session_step
                      , prev_train_time, session_train_time

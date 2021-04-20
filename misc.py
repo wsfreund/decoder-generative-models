@@ -1,6 +1,9 @@
 import functools
 import os
 
+class Container(object):
+  pass
+
 class CleareableCache(object):
   @classmethod
   def lru_cache(cl, *args, **kwargs):

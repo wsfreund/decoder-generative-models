@@ -49,7 +49,7 @@ class AutoEncoder( TrainBase ):
   def reconstruct(self, x, **call_kw):
     return self.reconstructor( x, **call_kw )
 
-  def performance_measure_fcn(self, sampler_ds, meters, lc):
+  def performance_measure_fcn(self, sampler_ds, meters):
     # FIXME Currently meters_dict is being ignored. 
     # TODO Probably this function can be implemented only on train_base
     # and use self._compute_target instead of self.reconstruct to

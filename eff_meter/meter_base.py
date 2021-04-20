@@ -20,18 +20,25 @@ class EffMeterBase(ABC):
     self._total_running_time = datetime.timedelta()
     self.data_parser = data_parser
     self.data_batch_counter = 0
+    self.data_tot_samps = 0
+    self._data_batch_size = None
     self._locked_data_statistics = False
 
   def update_on_data_batch(self, data, mask = None):
     if self._locked_data_statistics:
       return
     self.start
-    self.update_on_parsed_data(self.data_parser(data), mask)
+    bs = self.get_batch_size_from_data(data)
+    if self._data_batch_size is None:
+      self._data_batch_size = bs
+    corr_new, corr_tot = self._compute_corr_factors( bs, self.data_tot_samps ) if self._data_batch_size != bs else (1.,1.)
+    self.update_on_parsed_data(self.data_parser(data), mask, corr_new, corr_tot )
     self.data_batch_counter += 1
+    self.data_tot_samps += bs
     self.stop
 
   @abstractmethod
-  def update_on_parsed_data(self, data, mask):
+  def update_on_parsed_data(self, data, mask, corr_new = 1., corr_tot = 1.):
     pass
 
   @abstractmethod
@@ -39,6 +46,8 @@ class EffMeterBase(ABC):
     pass
 
   def initialize(self, wrapper):
+    if not hasattr(self,"get_batch_size_from_data") or self.get_batch_size_from_data is None:
+      self.get_batch_size_from_data = wrapper.get_batch_size_from_data
     pass
 
   @property
@@ -56,6 +65,12 @@ class EffMeterBase(ABC):
     self._step_deltatime = datetime.timedelta()
     if not self._locked_data_statistics:
       self.data_batch_counter = 0
+
+  def _compute_corr_factors(self, new_samps, prev_samps ):
+    corr_new = new_samps / prev_samps
+    tot_samps = new_samps + prev_samps
+    corr_tot =  prev_samps / tot_samps
+    return corr_new, corr_tot
 
   @property
   def print(self):
@@ -127,8 +142,13 @@ class EffBufferedMeter(EffMeterBase):
       self._data_buffer.append(self.data_parser(data), mask)
     if self._data_buffer.is_buffer_full or force_update:
       data, mask = self._data_buffer()
-      self.update_on_parsed_data(data, mask)
+      bs = self.get_batch_size_from_data(data)
+      if self._data_batch_size is None:
+        self._data_batch_size = bs
+      corr_new, corr_tot = self._compute_corr_factors( bs, self.data_tot_samps ) if self._data_batch_size != bs else (1.,1.)
+      self.update_on_parsed_data(self.data_parser(data), mask, corr_new, corr_tot )
       self.data_batch_counter += 1
+      self.data_tot_samps += bs
       self._data_buffer.lazy_clear()
     self.stop
 
@@ -138,23 +158,32 @@ class GenerativeEffMeter(EffMeterBase):
     super().__init__(name = name, data_parser = data_parser, **kw)
     self.gen_parser = gen_parser
     self.gen_batch_counter = 0
+    self.gen_tot_samps = 0
+    self._gen_batch_size = None
     self._locked_gen_statistics = False
 
   def initialize(self, wrapper):
-    self.data_parser = lambda x: wrapper._transform_to_meter_input(x)
-    self.gen_parser = lambda x: wrapper._transform_to_meter_input(x)
+    prev_data_parser = self.data_parser
+    self.data_parser = lambda x: wrapper._transform_to_meter_input(prev_data_parser(x))
+    prev_gen_parser = self.gen_parser
+    self.gen_parser = lambda x: wrapper._transform_to_meter_input(prev_gen_parser(x))
     super().initialize(wrapper)
 
   def update_on_gen_batch(self, data, mask = None):
     if self._locked_gen_statistics:
       return
     self.start
-    self.update_on_parsed_gen(self.gen_parser(data), mask)
+    bs = self.get_batch_size_from_data(data)
+    if self._gen_batch_size is None:
+      self._gen_batch_size = bs
+    corr_new, corr_tot = self._compute_corr_factors( bs, self.gen_tot_samps ) if self._gen_batch_size != bs else (1.,1.)
+    self.update_on_parsed_gen(self.gen_parser(data), mask, corr_new, corr_tot )
     self.gen_batch_counter += 1
+    self.gen_tot_samps += bs
     self.stop
 
   @abstractmethod
-  def update_on_parsed_gen(self, data, mask = None):
+  def update_on_parsed_gen(self, data, mask = None, corr_new = 1., corr_tot = 1.):
     pass
 
   def reset(self):
@@ -186,7 +215,12 @@ class GenerativeEffBufferedMeter(EffBufferedMeter, GenerativeEffMeter ):
       self._gen_buffer.append(self.gen_parser(data), mask)
     if self._gen_buffer.is_buffer_full or force_update:
       data, mask = self._gen_buffer()
-      self.update_on_parsed_gen(data,mask)
+      bs = self.get_batch_size_from_data(data)
+      if self._gen_batch_size is None:
+        self._gen_batch_size = bs
+      corr_new, corr_tot = self._compute_corr_factors( bs, self.gen_tot_samps ) if self._gen_batch_size != bs else (1.,1.)
+      self.update_on_parsed_gen(self.gen_parser(data), mask, corr_new, corr_tot )
       self.gen_batch_counter += 1
+      self.gen_tot_samps += bs
       self._gen_buffer.lazy_clear()
     self.stop

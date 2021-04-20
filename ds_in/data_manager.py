@@ -52,16 +52,22 @@ class TimeseriesMetadata(object):
 
   @property
   @functools.lru_cache()
-  def days_in_dataset(self):
+  def number_of_days_in_dataset(self):
     n_samples_h = len(self.df)
     years_per_dataset = (self.date_time[-1]-self.date_time[0]).total_seconds()/self.seconds_per_year
     return years_per_dataset
 
   @property
   @functools.lru_cache()
-  def years_in_dataset(self):
+  def number_of_years_in_dataset(self):
     years_per_dataset = (self.date_time[-1]-self.date_time[0]).total_seconds()/self.seconds_per_year
     return years_per_dataset
+
+  @property
+  @functools.lru_cache()
+  def years_in_dataset(self):
+    years = self.date_time.strftime("%Y").drop_duplicates().astype(np.int32).tolist()
+    return years
 
 class DataManagerBase(ABC):
   _basepaths = []

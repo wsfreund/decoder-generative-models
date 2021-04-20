@@ -18,7 +18,7 @@ class ePDFMeter(GenerativeEffMeter):
     self.dfR = np.ndarray(self.xs, dtype=np.object)
     self.dfG = np.ndarray(self.xs, dtype=np.object)
 
-  def update_on_parsed_data(self, data, mask):
+  def update_on_parsed_data(self, data, mask, corr_new = 1., corr_tot = 1.):
     if mask is not None:
       raise NotImplementedError("%s is not currently implemented for masked data" % self.__class__.__name__)
     if not isinstance(data, np.ndarray):
@@ -30,7 +30,7 @@ class ePDFMeter(GenerativeEffMeter):
       else:
         self.dfR[indexes] = dfR
 
-  def update_on_parsed_gen(self, data, mask = None ):
+  def update_on_parsed_gen(self, data, mask = None, corr_new = 1., corr_tot = 1.):
     if mask is not None:
       raise NotImplementedError("%s is not currently implemented for masked data" % self.__class__.__name__)
     if not isinstance(data, np.ndarray):

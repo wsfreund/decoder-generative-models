@@ -52,7 +52,7 @@ class DecoderGenerator(TrainBase):
       self._decorate_cardinality(sampler_ds, counter+1)
       # Loop over transported latent samples
       sample_iter = iter(sampler_ds)
-      for counter, latent_data in tqdm( self._latent_sampler_performance_ds
+      for counter, latent_data in tqdm( enumerate(self._latent_sampler_performance_ds)
                              , desc='Computing quantities on synthetic samples'
                              , total=self._latent_sampler_performance_ds_cardinality):
         sample_batch, sample_iter = self._secure_sample(sample_iter,sampler_ds)

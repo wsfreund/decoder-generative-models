@@ -41,6 +41,8 @@ class AISMeter(EffMeterBase):
     self.backward_avg_lower_bound_logp = []
 
   def initialize(self, wrapper):
+    # TODO
+    super().initialize(wrapper)
     self.wrapper = wrapper
     self.normalization_constant = tf.cast(tf.reduce_prod(wrapper._transform_to_meter_input(self.wrapper.generator.output).shape[1:]), tf.float32 )
 
@@ -56,7 +58,7 @@ class AISMeter(EffMeterBase):
              , nchains = self.nchains )
     return ais
 
-  def update_on_parsed_data(self, data, mask = None):
+  def update_on_parsed_data(self, data, mask = None, corr_new = 1., corr_tot = 1.):
     if mask is not None:
       raise NotImplementedError("%s is not currently implemented for masked data" % self.__class__.__name__)
     if self.max_ais_batches and self.data_batch_counter >= self.max_ais_batches:

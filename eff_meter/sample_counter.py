@@ -13,12 +13,12 @@ class GenerativePerfSamplerCounter(GenerativeEffMeter):
     self.n_data_samp = 0
     self.n_gen_samp = 0
 
-  def update_on_parsed_data(self, data, mask):
+  def update_on_parsed_data(self, data, mask, corr_new = 1.,  corr_tot = 1.):
     if mask is not None:
       raise NotImplementedError("%s is not currently implemented for masked data" % self.__class__.__name__)
     self.n_data_samp += data.shape[0]
 
-  def update_on_parsed_gen(self, data, mask = None ):
+  def update_on_parsed_gen(self, data, mask = None, corr_new = 1.,  corr_tot = 1. ):
     if mask is not None:
       raise NotImplementedError("%s is not currently implemented for masked data" % self.__class__.__name__)
     self.n_gen_samp += data.shape[0]

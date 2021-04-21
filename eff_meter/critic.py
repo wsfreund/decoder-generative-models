@@ -12,15 +12,16 @@ class CriticEffMeter(GenerativeEffMeter):
 
 
   def initialize(self, wrapper):
+    EffMeterBase.initialize(self,wrapper)
     self.data_parser = lambda x: wrapper.critic(x)
     self.gen_parser = lambda x: wrapper.critic(x)
 
-  def update_on_parsed_data(self, data, mask = None):
+  def update_on_parsed_data(self, data, mask = None, corr_new = 1.,  corr_tot = 1.):
     if mask is not None:
       raise NotImplementedError("%s is not currently implemented for masked data" % self.__class__.__name__)
     self.avg_output_data += tf.reduce_mean( data )
 
-  def update_on_parsed_gen(self, data, mask = None ):
+  def update_on_parsed_gen(self, data, mask = None, corr_new = 1.,  corr_tot = 1. ):
     if mask is not None:
       raise NotImplementedError("%s is not currently implemented for masked data" % self.__class__.__name__)
     self.avg_output_gen += tf.reduce_mean( data )

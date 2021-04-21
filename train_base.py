@@ -796,6 +796,8 @@ class TrainBase(MaskModel):
         cardinality = self._val_perf_cardinality
       else:
         raise RuntimeError("Unknown sampler.")
+    if hasattr(cardinality,'numpy'):
+      cardinality = cardinality.numpy()
     return cardinality
 
   def _decorate_cardinality(self, sampler, cardinality):

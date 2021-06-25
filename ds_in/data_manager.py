@@ -120,7 +120,7 @@ class DataFrameManager(DataManagerBase):
       del self.df
 
   def _get_data_at_path( self ):
-    formats = [".ft",".csv"]
+    formats = [".ft",".csv", ".pic", ".pic.bz2"]
     found = False
     for f in formats:
       data_path = os.path.join( 
@@ -137,15 +137,17 @@ class DataFrameManager(DataManagerBase):
   def _read( self ):
     # NOTE Overload this method if a particular dataset has special needs
     data_path = self.autolocate()
-    if self.format == ".csv":
+    if self.format in (".pic", ".pic.bz2"):
+      self.df = pd.read_pickle( data_path )
+    elif self.format == ".csv":
       self.df = pd.read_csv( data_path, header = None )
       self.df.columns = map(str,self.df.columns) # ensure that columns are strings
       self.df.to_feather(data_path[:-4]+'.ft')
-      if self._shuffle_on_first_read:
-        # TODO shuffle on first read for non time series data
-        raise NotImplementedError("Shuffle on first read is not implemented")
     elif self.format == ".ft":
       self.df = pd.read_feather( data_path )
+    if self._shuffle_on_first_read:
+      # TODO shuffle on first read for non time series data
+      raise NotImplementedError("Shuffle on first read is not implemented")
     self.data_path = data_path
     return self.df
 

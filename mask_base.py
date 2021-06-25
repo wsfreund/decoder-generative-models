@@ -9,12 +9,17 @@ except ImportError:
   from .misc import *
 
 class MaskModel(object):
+  """
+  Mask is [0.,,1.]^{n,...} tensor with same shape as the original data
+  indicating whether data is available (i.e. not missing) for that input.
+  In other words, a 1. flag indicates data is not missing.
+  """
 
   def _retrieve_data_and_mask( self, ip ):
     if isinstance(ip, tuple):
       data, mask = ip
     elif isinstance(ip, dict):
-      mask, data = ip["mask"], ip["data"]
+      data, mask = ip["data"], ip["mask"]
     else:
       data, mask = ip, None
     return data, mask

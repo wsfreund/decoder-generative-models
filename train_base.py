@@ -99,7 +99,7 @@ class TrainBase(MaskModel):
     # Epoches interval for saving current progress (model weights and training log)
     self._save_interval_epoches    = retrieve_kw(kw, 'save_interval_epoches',  None                                                     )
     # Use log-sampling periods of loss functions
-    self._use_log_history          = retrieve_kw(kw, 'use_log_history',      True                                                       )
+    self._use_log_history          = retrieve_kw(kw, 'use_log_history',      False                                                      )
     # Number of history samples when using log-sampled history
     self._history_max_batch_samples = retrieve_kw(kw, 'log_n_linear_history_samples',    50                                             )
     # Log-sampling period. To sample more, use lower values, i.e. 0.005. To sample less, higher values, i.e. 0.05
@@ -377,7 +377,7 @@ class TrainBase(MaskModel):
             if self._log_models_in_tensorboard:
               for callback in self._tensorboard_callback_dict.values():
                 callback.on_epoch_end(epoch = lc.step)
-                callback.on_train_batch_end(batch = lc.step)
+                callback.on_train_batch_end(batch = lc.step, logs = val_perf_dict)
             if ( not(lc.step % self._n_performance_measure_steps) or lc.step == 1):
               self._update_writer_file(self._surrogate_summary_writer)
               self._update_writer_file(self._train_perf_summary_writer)
@@ -516,6 +516,9 @@ class TrainBase(MaskModel):
     return optimizer
 
   def _save_optimizer( self, key, optimizer ):
+    if optimizer is None:
+      print('WARNING: Not saving empty optimizer at path "%s"' % key)
+      return
     np.savez( key, np.array(optimizer.get_weights(), dtype=np.object) )
 
   def load(self, path, val = False, load_opt = True, return_loss = False, return_locals = False ):

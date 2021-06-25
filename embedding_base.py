@@ -1,5 +1,6 @@
 import os
 import numpy as np
+import pandas as pd
 import tensorflow as tf
 from tensorflow.keras import layers
 import tensorflow_probability as tfp
@@ -18,7 +19,7 @@ class BiasInitializer(tf.keras.initializers.Initializer):
   def __call__(self, shape, dtype=None):
     return self.bias_init_values
 
-class SelectFeatures(layers.Layer):
+class SelectFeatureSlice(layers.Layer):
   def __init__(self, input_shape, start, n, **kw):
     self.start = start
     self.end = start + n
@@ -27,12 +28,25 @@ class SelectFeatures(layers.Layer):
   def call(self, inputs):
     return inputs[:,self.start:self.end]
 
+  def get_config(self):
+    return {'start': self.start, 'end': self.end}
+
+class SelectFeatureIndices(layers.Layer):
+  def __init__(self, input_shape, indices, **kw):
+    self.indices = indices
+    layers.Layer.__init__(self, **kw)
+
+  def call(self, inputs):
+    return tf.gather(inputs, self.indices, axis=-1)
+
+  def get_config(self):
+    return {'indices': self.indices,}
+
 class EmbeddingConfig(object):
   def __init__(self
         , input_info
         , embedding_layer_kwargs  = {}
-        , embedding_size_fcn = None
-        ):
+        , embedding_size_fcn = None):
     if not "kernel_initializer" in embedding_layer_kwargs:
       embedding_layer_kwargs["kernel_initializer"] = tf.keras.initializers.RandomUniform(0,1)
     self.embedding_layer_kwargs = embedding_layer_kwargs
@@ -52,13 +66,18 @@ class EmbeddingConfig(object):
           dim = min(50, int(np.round( np.sqrt( input_info.n_variables ) * np.log10( input_info.n_variables ) ) ) )
       else:
         #self.dim = int(np.round( np.sqrt( self.input_info.n_variables ) ) )
-        dim = int( input_info.n_variables // 2 )
+        if input_info.n_variables == 3:
+          dim = 2
+        elif input_info.n_variables == 2:
+          dim = 1
+        else:
+          dim = int( input_info.n_variables // 2 )
     return dim
 
   @property
   def dim( self ):
     dim = self.embedding_size_fcn(self.input_info)
-    if bool(dim) and dim <= 1:
+    if bool(dim) and dim < 1:
       dim = None
     return dim
 
@@ -112,10 +131,11 @@ class OutputHeadConfig(object):
       output_n_hidden = None
     return output_n_hidden
 
-  def use_default_marginal_statistics_bias(self, data, mask):
+  def use_default_marginal_statistics_bias(self, data, mask = None):
     acc = np.sum(data, axis=0)
-    div = np.sum(mask, axis=0)
-    div[div==0.] = 1.
+    if mask is not None:
+      div = np.sum(mask, axis=0)
+      div[div==0.] = 1.
     if self.output_activation is tf.keras.activations.softmax:
       inverse_function = tfp.math.softplus_inverse
     elif self.output_activation is tf.keras.activations.sigmoid:
@@ -124,7 +144,8 @@ class OutputHeadConfig(object):
       inverse_function = lambda x: 0.5*np.log( (1 + x) / (1 - x) )
     elif self.output_activation is tf.keras.activations.linear:
       inverse_function = lambda x: x
-    statistics = ( acc / div )
+    if mask is not None:
+      statistics = ( acc / div )
     bias = inverse_function( statistics )
     bias = np.where( np.isfinite( bias ), bias, np.zeros_like( bias ) )
     name = self.category_name if hasattr(self,"category_name") else "NumericalInputs"
@@ -134,193 +155,290 @@ class OutputHeadConfig(object):
 
 class ModelWithEmbeddings( BeyondNumericalDataModel ):
 
-  def __init__(self
-      , input_info_dict
-      , embeddings_master_switch = True
-      , output_head_hidden_layer_master_switch = True
-      , output_head_bias_statistics_master_switch = True
-      , **kw):
-    super().__init__(input_info_dict, **kw)
-    self._embeddings_master_switch = embeddings_master_switch
-    self._output_head_hidden_layer_master_switch = output_head_hidden_layer_master_switch 
-    self._output_head_bias_statistics_master_switch = output_head_bias_statistics_master_switch
+  def __init__(self, data_sampler, **kw):
+    self._embeddings_master_switch                  = retrieve_kw( kw, 'embeddings_master_switch',                  True )
+    self._output_head_hidden_layer_master_switch    = retrieve_kw( kw, 'output_head_hidden_layer_master_switch',    True )
+    self._output_head_bias_statistics_master_switch = retrieve_kw( kw, 'output_head_bias_statistics_master_switch', True )
+    super().__init__( data_sampler, **kw )
+
+  def get_batch_size_from_data(self, data):
+    return data['categorical']['data'].shape[0]
+
+  def _create_binary_input_layers( self ):
+    """
+    Define binary_input, processed_binary_input and binary_config_dict. 
+    Can be overloaded to create more complex input models.
+    """
+    import unidecode
+    self.binary_input = layers.Input(shape=(self.data_sampler.n_binary_vars,), dtype=tf.int32, name = 'binary_inputs')
+    self.binary_mask  = layers.Input(shape=(self.data_sampler.n_binary_vars,), dtype=tf.float32, name = 'binary_mask')
+    self.processed_binary_input = []
+    self._binary_config_dict = {}
+    for idx, var_name in enumerate(self.data_sampler.binary_vars):
+      name = unidecode.unidecode(var_name).replace(' ','_')
+      raw_input_ = SelectFeatureIndices( input_shape=self.categorical_input.shape
+                                       , indices = [idx]
+                                       , name = name + '_Select')(self.binary_input)
+      processed_input = tf.keras.layers.Lambda( lambda x: tf.cast(x, tf.float32), dtype = tf.float32 )( raw_input_ )
+      self.processed_binary_input.append(processed_input)
+      info = BinaryInputInfo( category_name    = name
+                            , variable_names   = ['Not' + var_name,'Is' + var_name]
+                            , variable_indices = [idx] )
+      eConf = EmbeddingConfig( input_info = info )
+      self._binary_config_dict[var_name] = eConf 
+    return
+
+  def _create_categorical_input_layers( self, embedding_config_dict = NotSet, embedding_size_fcn = NotSet ):
+    """
+    Define categorical_input, one_hot_layers, processed_categorical_input and categorical_config_dict
+    Can be overloaded to create more complex input models
+    """
+    import unidecode
+    self.categorical_input = layers.Input(shape=(self.data_sampler.n_categorical_vars,), dtype=tf.int32, name = 'categorical_inputs')
+    self.categorical_mask = layers.Input(shape=(self.data_sampler.n_categorical_vars,), dtype=tf.float32, name = 'categorical_mask')
+    self.one_hot_layers = []
+    self.processed_categorical_input = []
+    vocabulary = self.data_sampler.vocabulary
+    one_hot_idx = 0
+    self._categorical_config_dict = {} if embedding_config_dict in (NotSet,None) else embedding_config_dict
+    for idx, var_name in enumerate(self.data_sampler.categorical_vars):
+      name = unidecode.unidecode(var_name).replace(' ','_')
+      # Select raw input
+      raw_input_ = SelectFeatureIndices( input_shape=self.categorical_input.shape
+                                       , indices = [idx]
+                                       , name = name + "_Select")(self.categorical_input)
+      # Check the categorical information:
+      categories = vocabulary[var_name]
+      n_cat = len(categories)
+      lslice = slice(one_hot_idx,one_hot_idx+n_cat)
+      one_hot_repr = OneHotEncodingLayerWithIntCategories(name = name + "_OneHot", depth=n_cat)(raw_input_)
+      self.one_hot_layers.append(one_hot_repr)
+      if var_name not in self._categorical_config_dict:
+        info = CategoricalGroupInputInfo( category_name = name
+                                        , variable_names = categories
+                                        , variable_indices = lslice )
+        eConf = EmbeddingConfig( input_info = info, embedding_size_fcn = embedding_size_fcn )
+        self._categorical_config_dict[var_name] = eConf 
+      one_hot_idx += n_cat
+      # Add embedding:
+      if self._embeddings_master_switch:
+        processed_input = layers.Dense( eConf.dim, name = name + '_Embedding'
+                                      , input_dim = (info.n_variables,)
+                                      , **eConf.embedding_layer_kwargs)(one_hot_repr)
+      else:
+        processed_input = tf.keras.layers.Lambda( lambda x: tf.cast(x, tf.float32), dtype = tf.float32 )( one_hot_repr )
+      self.processed_categorical_input.append(processed_input)
+    return
+
+  def _create_numerical_input_layers( self ):
+    """
+    Define numerical_input and processed_numerical_input. 
+    Can be overloaded to create more complex input models.
+    """
+    self.numerical_input = layers.Input(shape=(self.data_sampler.n_numerical_vars,), name = 'numerical_inputs')
+    self.numerical_mask  = layers.Input(shape=(self.data_sampler.n_numerical_vars,), name = 'numerical_mask')
+    self.processed_numerical_input = self.numerical_input
+    return
 
   def _create_initial_layers( self, embedding_config_dict = NotSet, embedding_size_fcn = NotSet ):
-    if not embedding_config_dict:
-      embedding_config_dict = { k : EmbeddingConfig( input_info = v, embedding_size_fcn = embedding_size_fcn ) for k, v in self._input_info_dict.items() }
-    self._embedding_config_dict = embedding_config_dict
-    import unidecode
-    model_inputs = []
-    raw_inputs = []
-    #
-    sigmoid_inputs = []
-    softmax_inputs = []
-    numerical_inputs = []
-    #
-    softmax_mask_slice = []
-    sigmoid_mask_slice = []
-    numerical_mask_slice = []
-    #
-    flatten_input = layers.Input(shape=(self._n_features,))
-    c_input = 0; c_mask_input = 0;
-    for name, info, econf in zip(self._input_info_dict.keys(), self._input_info_dict.values(), self._embedding_config_dict.values()):
-      # Select features:
-      name = unidecode.unidecode(name).replace(' ','_') + "_Select"
-      raw_in = SelectFeatures(input_shape=flatten_input.shape, start=c_input, n=info.n_variables, name = name)(flatten_input)
-      # Add embedding:
-      if econf and self._embeddings_master_switch:
-        if isinstance(info, CategoricalInputInfoBase):
-          #if info.already_as_one_hot:
-            model_input = layers.Dense(econf.dim
-                , input_dim = info.n_variables
-                , **econf.embedding_layer_kwargs)(raw_in)
-          #else:
-          #  model_input = layers.Embedding( input_dim = info.n_variables
-          #      , output_dim = econf.dim 
-          #      )
-        else:
-          model_input = layers.Dense(econf.dim
-              , input_dim = info.n_variables
-              , **econf.embedding_layer_kwargs)(raw_in)
-      else:
-        model_input = raw_in
-      # Register input category
-      if isinstance(info, CategoricalInputInfoBase):
-        if isinstance(info, BinaryInputInfo):
-          sigmoid_inputs.append(raw_in)
-          sigmoid_mask_slice.append(c_mask_input)
-        elif isinstance(info, CategoricalGroupInputInfo):
-          softmax_inputs.append(raw_in)
-          softmax_mask_slice.append(c_mask_input)
-        c_mask_input += 1
-      else:
-        numerical_inputs.append(raw_in)
-        numerical_mask_slice += list(range(c_mask_input, c_mask_input + info.n_variables))
-        c_mask_input += info.n_variables
-      model_inputs.append(model_input)
-      raw_inputs.append(raw_in)
-      c_input += info.n_variables
-    if len(model_inputs) > 1:
-      model_input = layers.Concatenate( axis = -1)( model_inputs )
-    else:
-      model_input = model_input
-    self._raw_inputs    = raw_inputs
-    self._model_input   = model_input
-    self._flatten_input = flatten_input
-    # 
-    self._sigmoid_input_layers  = sigmoid_inputs
-    startpos = 0
-    endpos = startpos+len(sigmoid_inputs)
-    self._sigmoid_input_slice = slice(startpos,endpos)
-    self._softmax_input_layers = softmax_inputs
-    startpos = endpos
-    endpos = startpos+len(softmax_inputs)
-    self._softmax_input_slice = slice(startpos,endpos)
-    self._numerical_input_layer = layers.Concatenate( axis = -1)( numerical_inputs ) if len(numerical_inputs) > 1 else numerical_inputs[0]
-    startpos = endpos
-    endpos = startpos+1
-    self._numerical_input_slice = slice(startpos,endpos)
-    self._input_end_pos = endpos
-    #
-    self._softmax_mask_select,  self._softmax_mask_shape    = self._create_mask_from_slice( softmax_mask_slice   )
-    self._sigmoid_mask_select, self._sigmoid_mask_shape     = self._create_mask_from_slice( sigmoid_mask_slice  )
-    self._numerical_mask_select, self._numerical_mask_shape = self._create_mask_from_slice( numerical_mask_slice )
-    self._has_softmax   = tf.constant( len(softmax_mask_slice) > 0,   tf.bool )
-    self._has_sigmoid   = tf.constant( len(sigmoid_mask_slice) > 0,  tf.bool )
-    self._has_numerical = tf.constant( len(numerical_mask_slice) > 0, tf.bool )
-    return flatten_input, model_input
+    # Process raw input
+    self._create_categorical_input_layers( embedding_config_dict, embedding_size_fcn )
+    self._create_binary_input_layers()
+    self._create_numerical_input_layers()
+    # Merge processed input
+    processed_input_list = self.processed_binary_input + self.processed_categorical_input + [self.processed_numerical_input] 
+    self._flatten_processed_input = layers.Concatenate( axis = -1 )( processed_input_list ) if len(processed_input_list) > 1 else processed_input_list[0]
+    # Flag how to processed information
+    self._has_sigmoid   = tf.constant( len(self.processed_binary_input) > 0, tf.bool )
+    self._has_softmax   = tf.constant( len(self.processed_categorical_input) > 0,  tf.bool )
+    self._has_numerical = tf.constant( self.data_sampler.n_numerical_vars > 0, tf.bool )
+    # Create raw model input
+    self.input = {}
+    if self._has_sigmoid:   self.input['binary']      = {'data' : self.binary_input,      'mask' : self.binary_mask      }
+    if self._has_softmax:   self.input['categorical'] = {'data' : self.categorical_input, 'mask' : self.categorical_mask }
+    if self._has_numerical: self.input['numerical']   = {'data' : self.numerical_input,   'mask' : self.numerical_mask   }
+    return self.input, self._flatten_processed_input
 
-  def _create_final_layers( self, final_codes, output_head_config_dict = NotSet
+  def _retrieve_output_head_config(self, var_name, eConf, output_head_config_dict, output_head_hidden_model_config_fcn):
+    if var_name not in output_head_config_dict:
+      oConf = OutputHeadConfig( input_info = eConf.input_info
+                              , embedding_config = eConf
+                              , output_head_hidden_model_config_fcn = output_head_hidden_model_config_fcn )
+    else:
+      oConf = output_head_config_dict[var_name]
+    return oConf
+
+  def _output_head( self
+                  , previous_final_output_layer
+                  , use_batch_normalization
+                  , hidden_layer_activation_type
+                  , use_dropout
+                  , oConf ):
+    if oConf.output_n_hidden and self._output_head_hidden_layer_master_switch:
+      output = layers.Dense( oConf.output_n_hidden, name = oConf.input_info.category_name + '_Hidden'
+                           , **oConf.output_hidden_layer_kwargs )(previous_final_output_layer)
+      if use_batch_normalization: output = layers.BatchNormalization(name = oConf.input_info.category_name + '_BN')(output)
+      if hidden_layer_activation_type: output = layers.Activation( hidden_layer_activation_type, name = oConf.input_info.category_name + '_HiddenActivation' )(output)
+      if use_dropout: output = layers.Dropout(rate=0.1)(output)
+    else:
+      output = previous_final_output_layer
+    return output
+
+  def _marginal_statistics_fixer( self, output, oConf ):
+    if oConf.use_marginal_statistics and self._output_head_hidden_layer_master_switch:
+      oConf.use_default_marginal_statistics_bias( 
+          self.data_sampler.raw_train_data['categorical'].iloc[:,info.indices],
+          #self._expand_mask( self.data_sampler.train_mask_df )[:,n_variables:n_variables+info.n_variables]
+      )
+      output = layers.Dense(info.n_variables, name = name + "_marginal_statistics_fixer"
+          , weights = [tf.eye(info.n_variables), oConf.bias], trainable = False )(output)
+    return output
+
+  def _create_binary_output_layers( self
+      , previous_final_output_layer
+      , output_head_config_dict = NotSet
+      , hidden_layer_activation_type = NotSet
+      , output_head_hidden_model_config_fcn = NotSet
+      , use_batch_normalization = False
+      , use_dropout = False
+      ):
+    """
+    Can be overloaded to create more complex output models
+    """
+    self.binary_logits = []
+    self.binary_activation = []
+    for idx, var_name in enumerate(self.data_sampler.binary_vars):
+      eConf = self._binary_config_dict[var_name]
+      oConf = self._retrieve_output_head_config( var_name, eConf, output_head_config_dict, output_head_hidden_model_config_fcn )
+      output = self._output_head( previous_final_output_layer
+                  , use_batch_normalization
+                  , hidden_layer_activation_type
+                  , use_dropout
+                  , oConf )
+      binary_logits_layer = layers.Dense( oConf.input_info.n_variables
+                                        , name = oConf.input_info.category_name + "_Logits"
+                                        , **oConf.output_layer_kwargs )
+      binary_logits = binary_logits_layer(output)
+      self.binary_logits.append(binary_logits)
+      #output = self._marginal_statistics_fixer( output, oConf )
+      activation_output = layers.Activation( oConf.output_activation
+          , name = var_name + '_' + oConf.output_activation.__name__
+      )(binary_logits)
+      self.binary_activation.append(activation_output)
+    return
+
+  def _create_categorical_output_layers( self
+      , previous_final_output_layer
+      , output_head_config_dict = NotSet
+      , hidden_layer_activation_type = NotSet
+      , output_head_hidden_model_config_fcn = NotSet
+      , use_batch_normalization = False
+      , use_dropout = False
+      ):
+    """
+    Can be overloaded to create more complex output models
+    """
+    self.categorical_logits = []
+    self.categorical_activation = []
+    for idx, var_name in enumerate(self.data_sampler.categorical_vars):
+      eConf = self._categorical_config_dict[var_name]
+      oConf = self._retrieve_output_head_config( var_name, eConf, output_head_config_dict, output_head_hidden_model_config_fcn )
+      output = self._output_head( previous_final_output_layer
+                  , use_batch_normalization
+                  , hidden_layer_activation_type
+                  , use_dropout
+                  , oConf )
+      categorical_logits_layer = layers.Dense( oConf.input_info.n_variables
+                                             , name = oConf.input_info.category_name + "_Logits"
+                                             , **oConf.output_layer_kwargs )
+      categorical_logits = categorical_logits_layer(output)
+      self.categorical_logits.append(categorical_logits)
+      #output = self._marginal_statistics_fixer( output, oConf )
+      activation_output = layers.Activation( oConf.output_activation
+          , name = var_name + '_' + oConf.output_activation.__name__
+      )(categorical_logits)
+      self.categorical_activation.append(activation_output)
+    return
+
+  def _create_numerical_output_layer( self, previous_final_output_layer ):
+    self.numerical_output = layers.Dense( self.numerical_input.shape[-1], name = 'NumericalOutputs')(previous_final_output_layer)
+    return
+
+  def _create_final_layers( self
+      , previous_final_output_layer
+      , output_head_config_dict = NotSet
       , hidden_layer_activation_type = NotSet
       , output_head_hidden_model_config_fcn = NotSet
       , use_batch_normalization = False
       , use_dropout = False  ):
-    import unidecode
-    # TODO output_head_config should bring inside the OutputHeadConfig the full processing chain for each head. I.e. remove batch normalization etc
-    if not output_head_config_dict:
-      output_head_config_dict = { k : OutputHeadConfig( 
-        input_info = v, embedding_config = e, output_head_hidden_model_config_fcn = output_head_hidden_model_config_fcn )
-        for (k, v), e in zip(self._input_info_dict.items(), self._embedding_config_dict.values() ) }
-    self._output_head_config_dict = output_head_config_dict
-    dense_final_code = False
-    if not isinstance(final_codes, (tuple,list)):
-      dense_final_code = True
-      final_codes = [final_codes]*len(self._input_info_dict)
-    assert len(final_codes) == len(self._input_info_dict)
-    n_variables = 0
-    outputs = []
-    sigmoid_logits = []
-    softmax_logits = []
-    numerical_outputs = []
-    for name, info, oConf, code in zip(self._input_info_dict.keys(), self._input_info_dict.values(), self._output_head_config_dict.values(), final_codes):
-      name = unidecode.unidecode(name).replace(' ','_') + "_Head"
-      if oConf.output_n_hidden and self._output_head_hidden_layer_master_switch:
-        # FIXME Improve (just place the hidden model from oConf here)
-        # The hidden layer
-        output = layers.Dense(oConf.output_n_hidden
-            , name = name
-            , **oConf.output_hidden_layer_kwargs )(code)
-        if use_batch_normalization:
-          output = layers.BatchNormalization()(output)
-        output = layers.Activation( hidden_layer_activation_type )(output)
-        if use_dropout:
-          output = layers.Dropout(rate=0.1)(output)
-        # The output layer
-        output = layers.Dense( info.n_variables,
-            name = name + ("_Logits" if isinstance(info, CategoricalInputInfoBase) else "_Outputs")
-            , **oConf.output_layer_kwargs
-            )(output)
-      else:
-        # The output layer
-        output = layers.Dense( info.n_variables,
-            name = name + ("_Logits" if isinstance(info, CategoricalInputInfoBase) else "_Outputs")
-            , **oConf.output_layer_kwargs
-            )(code)
-      # Fix marginal statistics using bias?
-      if oConf.use_marginal_statistics and self._output_head_hidden_layer_master_switch:
-        oConf.use_default_marginal_statistics_bias( 
-            self._data_sampler.train_df[:,n_variables:n_variables+info.n_variables],
-            self._expand_mask( self._data_sampler.train_mask_df )[:,n_variables:n_variables+info.n_variables]
-        )
-        output = layers.Dense(info.n_variables
-            , name = name + "_marginal_statistics_fixer"
-            , weights = [tf.eye(info.n_variables), oConf.bias]
-            , trainable = False )(output)
-      # Output activation
-      if oConf.output_activation:
-        # Add the logits 
-        if oConf.output_activation is tf.keras.activations.sigmoid:
-          sigmoid_logits.append(output)
-        elif oConf.output_activation is tf.keras.activations.softmax:
-          softmax_logits.append(output)
-        output = layers.Activation( oConf.output_activation
-            , name = oConf.output_activation.__name__ + "_" + str(n_variables) + "_" + str(n_variables+info.n_variables)
-            )(output)
-      if not(isinstance(info, CategoricalInputInfoBase)):
-        numerical_outputs.append(output)
-      outputs.append(output)
-      n_variables += info.n_variables
-    flatten_output = layers.Concatenate( axis = -1)( outputs ) if len(outputs) > 1 else output
-    self._flatten_output = flatten_output
-    self._raw_outputs = outputs
-    #
-    self._sigmoid_logits_layers  = sigmoid_logits
-    startpos = self._input_end_pos
-    endpos = startpos+len(sigmoid_logits)
-    self._sigmoid_logits_slice = slice(startpos,endpos)
-    self._softmax_logits_layers   = softmax_logits
-    startpos = endpos
-    endpos = startpos+len(softmax_logits)
-    self._softmax_logits_slice = slice(startpos,endpos)
-    self._numerical_output_layer = layers.Concatenate( axis = -1)( numerical_outputs ) if len(numerical_outputs) > 1 else numerical_outputs[0]
-    startpos = endpos
-    endpos = startpos+1
-    self._numerical_output_slice = slice(startpos,endpos)
-    del(self._input_end_pos)
-    return flatten_output
+    if output_head_config_dict in (NotSet,None):
+      output_head_config_dict = {}
+    kwargs = dict( output_head_config_dict = output_head_config_dict
+                 , hidden_layer_activation_type = hidden_layer_activation_type 
+                 , output_head_hidden_model_config_fcn = output_head_hidden_model_config_fcn 
+                 , use_batch_normalization = use_batch_normalization
+                 , use_dropout = use_dropout )
+    self.output = {}
+    if self._has_sigmoid:
+      self._create_binary_output_layers( previous_final_output_layer, **kwargs )
+      self.output['binary'] = self._concatenate_list_of_layers( self.binary_activation )
+    if self._has_softmax:
+      self._create_categorical_output_layers( previous_final_output_layer, **kwargs )
+      self.output['categorical'] = self._concatenate_list_of_layers( self.categorical_activation )
+    if self._has_numerical:
+      self._create_numerical_output_layer( previous_final_output_layer )
+      self.output['numerical'] = self.numerical_output 
+    self._create_training_model()
+    return self.output
 
-  def _create_mask_from_slice(self, s):
-    mask = np.zeros((1, self._n_mask_inputs), dtype=np.bool)
-    for i in s:
-      mask[:,i] = True
-    return tf.constant(mask, dtype=tf.bool), [len(s),]
+  def _create_training_model(self):
+    training_output_dict = { 'sigmoid_targets':   self.processed_binary_input
+                           , 'softmax_targets':   self.one_hot_layers
+                           , 'numerical_targets': self.processed_numerical_input
+                           , 'sigmoid_logits':    self.binary_logits
+                           , 'softmax_logits':    self.categorical_logits
+                           , 'numerical_outputs': self.numerical_output }
+    self._training_model = tf.keras.Model(self.input, training_output_dict, name = "training_model")
+    return
+
+  def _concatenate_list_of_layers( self, list_of_layers ):
+    return layers.Concatenate( axis = -1 )( list_of_layers ) if len(list_of_layers) > 1 else list_of_layers[0]
+
+class OneHotEncodingLayerWithIntCategories(layers.experimental.preprocessing.PreprocessingLayer):
+  def __init__(self, depth, **kw):
+    super().__init__(**kw)
+    self.depth = depth
+
+  def call(self,inputs):
+    encoded = tf.one_hot(inputs, self.depth)
+    return layers.Reshape((self.depth,))(encoded)
+
+  def get_config(self):
+    return {'depth': self.depth,}
+
+class OneHotEncodingLayerWithStringCategories(layers.experimental.preprocessing.PreprocessingLayer):
+  """
+  Adapted from https://towardsdatascience.com/building-a-one-hot-encoding-layer-with-tensorflow-f907d686bf39
+  """
+
+  def __init__(self, vocabulary=None):
+    super().__init__()
+    self.vectorization = layers.experimental.preprocessing.TextVectorization(output_sequence_length=1)  
+    self.adapt(vocabulary)
+
+  def adapt(self, data):
+    self.vectorization.adapt(data)
+    vocab = self.vectorization.get_vocabulary()
+    self.depth = len(vocab)
+    indices = [i[0] for i in self.vectorization([[v] for v in vocab]).numpy()]
+    self.minimum = min(indices)
+
+  def call(self,inputs):
+    vectorized = self.vectorization.call(inputs)
+    subtracted = tf.subtract(vectorized, tf.constant([self.minimum], dtype=tf.int64))
+    encoded = tf.one_hot(subtracted, self.depth)
+    return layers.Reshape((self.depth,))(encoded)
+
+  def get_config(self):
+    return {'vocabulary': self.vectorization.get_vocabulary(), 'depth': self.depth, 'minimum': self.minimum}
+

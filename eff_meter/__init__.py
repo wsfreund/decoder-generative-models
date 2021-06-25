@@ -1,4 +1,5 @@
 from .meter_base import *
+from .ae_mse import AE_EffMeter
 from .acf import ACFMeter, ACFBufferedMeter
 from .ais import AISMeter
 from .cacf import CACFMeter
